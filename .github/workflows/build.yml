@@ -32,7 +32,7 @@ jobs:
             artifact: RustSIPPhone-linux
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Third-party actions are pinned to a commit hash, not to a movable tag.
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch
@@ -86,7 +86,7 @@ jobs:
           cp assets/icon.png stage/RustSIPPhone/rustsipphone.png
           tar -C stage -czf out/RustSIPPhone-linux-x86_64.tar.gz RustSIPPhone
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}
           path: out/*
@@ -100,7 +100,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: out
           merge-multiple: true
