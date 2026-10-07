@@ -4,9 +4,10 @@ use crate::audio::{AudioIo, SpeakerQueue};
 use crate::g711::Codec;
 use crate::rtp::{self, RtpHeader};
 use crate::sdp::Remote;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -34,6 +35,7 @@ pub async fn run(
     remote: Remote,
     mut audio: AudioIo,
     control: MediaControl,
+    signalling_ip: IpAddr,
     stop: CancellationToken,
 ) -> MediaStats {
     // Звук, накопленный за время дозвона, не нужен.
@@ -44,9 +46,10 @@ pub async fn run(
     let codec = remote.codec;
     let dtmf_pt = remote.dtmf_pt;
 
+    let filter = PeerFilter::new(remote.addr.ip(), signalling_ip);
     let ((), received) = tokio::join!(
         send_loop(&socket, codec, dtmf_pt, &mut audio.mic, control, remote_rx, &stop),
-        receive_loop(&socket, codec, speaker, remote_tx, &stop),
+        receive_loop(&socket, codec, speaker, remote_tx, filter, &stop),
     );
     MediaStats { received }
 }
@@ -171,11 +174,12 @@ async fn receive_loop(
     codec: Codec,
     speaker: SpeakerQueue,
     remote: watch::Sender<SocketAddr>,
+    mut filter: PeerFilter,
     stop: &CancellationToken,
 ) -> u64 {
     let mut buf = [0u8; 2048];
     let mut received = 0u64;
-    let mut peer_ssrc: Option<u32> = None;
+    let started = Instant::now();
 
     loop {
         let (len, source) = tokio::select! {
@@ -183,7 +187,7 @@ async fn receive_loop(
             result = socket.recv_from(&mut buf) => match result {
                 Ok(pair) => pair,
                 Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 }
             },
@@ -192,16 +196,17 @@ async fn receive_loop(
             continue;
         };
         if header.payload_type != codec.payload_type() {
-            continue; // DTMF, comfort noise и прочее нам не нужно
+            continue; // DTMF, comfort noise, etc. are not played
         }
-        // Симметричный RTP: если звук идёт с другого адреса (NAT), отвечаем туда же.
-        // Привязываемся только к тому SSRC, что пришёл первым, чтобы посторонний пакет не перехватил поток.
-        let ssrc = *peer_ssrc.get_or_insert(header.ssrc);
-        if header.ssrc != ssrc {
-            continue;
-        }
-        if *remote.borrow() != source {
-            let _ = remote.send(source);
+        match filter.check(source, &header, started.elapsed()) {
+            Verdict::Drop => continue,
+            Verdict::Accept { latch } => {
+                // Symmetric RTP: the first accepted packet decides where our audio goes
+                // (a NAT usually rewrites only the port). It never changes afterwards.
+                if latch && *remote.borrow() != source {
+                    let _ = remote.send(source);
+                }
+            }
         }
         received += 1;
         let samples = codec.decode(payload);
@@ -211,6 +216,108 @@ async fn receive_loop(
             .push(&samples);
     }
     received
+}
+
+/// How long after the call starts we may learn the peer's address from the media itself
+/// when the SDP advertised an unroutable (private) address.
+const NAT_LEARN_WINDOW: Duration = Duration::from_secs(10);
+/// Consecutive in-sequence packets required before trusting an unexpected source.
+const NAT_LEARN_PACKETS: u32 = 5;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Drop,
+    /// `latch` is true only for the very first accepted packet.
+    Accept { latch: bool },
+}
+
+struct Candidate {
+    source: SocketAddr,
+    ssrc: u32,
+    last_sequence: u16,
+    count: u32,
+}
+
+/// Decides which incoming RTP packets are allowed to reach the speaker.
+///
+/// Plain RTP carries no authentication, so we limit what a third party can do:
+/// * packets are accepted only from the IPs we negotiated with (the SDP address
+///   and the signalling server, which usually hosts the media relay);
+/// * the first accepted packet pins source address and SSRC for the rest of the call;
+/// * only if the SDP address is private (the peer is behind NAT) do we learn another
+///   address, and then only from a short, strictly sequential burst early in the call.
+///
+/// This does not stop an attacker who can spoof a trusted IP; that needs SRTP.
+struct PeerFilter {
+    trusted: Vec<IpAddr>,
+    allow_nat_learning: bool,
+    pinned: Option<(SocketAddr, u32)>,
+    candidate: Option<Candidate>,
+}
+
+impl PeerFilter {
+    fn new(sdp_ip: IpAddr, signalling_ip: IpAddr) -> Self {
+        PeerFilter {
+            trusted: vec![sdp_ip, signalling_ip],
+            allow_nat_learning: !is_publicly_routable(sdp_ip),
+            pinned: None,
+            candidate: None,
+        }
+    }
+
+    fn check(&mut self, source: SocketAddr, header: &RtpHeader, elapsed: Duration) -> Verdict {
+        if let Some((addr, ssrc)) = self.pinned {
+            return if source == addr && header.ssrc == ssrc {
+                Verdict::Accept { latch: false }
+            } else {
+                Verdict::Drop
+            };
+        }
+        if self.trusted.contains(&source.ip()) {
+            self.pinned = Some((source, header.ssrc));
+            return Verdict::Accept { latch: true };
+        }
+        if !self.allow_nat_learning || elapsed > NAT_LEARN_WINDOW {
+            return Verdict::Drop;
+        }
+        let continues = matches!(&self.candidate, Some(c)
+            if c.source == source
+                && c.ssrc == header.ssrc
+                && header.sequence == c.last_sequence.wrapping_add(1));
+        if continues {
+            let candidate = self.candidate.as_mut().expect("checked above");
+            candidate.last_sequence = header.sequence;
+            candidate.count += 1;
+            if candidate.count >= NAT_LEARN_PACKETS {
+                self.trusted.push(source.ip());
+                self.pinned = Some((source, header.ssrc));
+                return Verdict::Accept { latch: true };
+            }
+        } else {
+            self.candidate = Some(Candidate {
+                source,
+                ssrc: header.ssrc,
+                last_sequence: header.sequence,
+                count: 1,
+            });
+        }
+        Verdict::Drop
+    }
+}
+
+fn is_publicly_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified())
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || first & 0xfe00 == 0xfc00 // unique local
+                || first & 0xffc0 == 0xfe80) // link local
+        }
+    }
 }
 
 struct XorShift(u64);
@@ -246,5 +353,80 @@ mod tests {
         assert_eq!(dtmf_event_code('#'), Some(11));
         assert_eq!(dtmf_event_code('b'), Some(13));
         assert_eq!(dtmf_event_code('x'), None);
+    }
+
+    fn header(ssrc: u32, sequence: u16) -> RtpHeader {
+        RtpHeader {
+            payload_type: 0,
+            marker: false,
+            sequence,
+            timestamp: 0,
+            ssrc,
+        }
+    }
+
+    fn addr(text: &str) -> SocketAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn pins_first_trusted_source_and_ssrc() {
+        let mut f = PeerFilter::new("203.0.113.5".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        let t = Duration::ZERO;
+        assert_eq!(f.check(addr("203.0.113.5:4000"), &header(7, 1), t), Verdict::Accept { latch: true });
+        assert_eq!(f.check(addr("203.0.113.5:4000"), &header(7, 2), t), Verdict::Accept { latch: false });
+        // Same IP, other port or other SSRC: refused after pinning.
+        assert_eq!(f.check(addr("203.0.113.5:4002"), &header(7, 3), t), Verdict::Drop);
+        assert_eq!(f.check(addr("203.0.113.5:4000"), &header(8, 3), t), Verdict::Drop);
+    }
+
+    #[test]
+    fn stranger_cannot_pin_before_the_real_peer() {
+        let mut f = PeerFilter::new("203.0.113.5".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        for seq in 0..50 {
+            assert_eq!(f.check(addr("198.51.100.66:9999"), &header(666, seq), Duration::ZERO), Verdict::Drop);
+        }
+        assert_eq!(
+            f.check(addr("203.0.113.5:4000"), &header(7, 1), Duration::ZERO),
+            Verdict::Accept { latch: true }
+        );
+    }
+
+    #[test]
+    fn signalling_server_is_trusted() {
+        let mut f = PeerFilter::new("203.0.113.5".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        assert_eq!(
+            f.check(addr("203.0.113.9:20000"), &header(1, 1), Duration::ZERO),
+            Verdict::Accept { latch: true }
+        );
+    }
+
+    #[test]
+    fn nat_learning_needs_a_sequential_burst() {
+        // SDP says 192.168.1.20, but the audio really comes from a public address.
+        let mut f = PeerFilter::new("192.168.1.20".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        let src = addr("198.51.100.7:5004");
+        for seq in 10..14 {
+            assert_eq!(f.check(src, &header(3, seq), Duration::from_secs(1)), Verdict::Drop);
+        }
+        assert_eq!(f.check(src, &header(3, 14), Duration::from_secs(1)), Verdict::Accept { latch: true });
+    }
+
+    #[test]
+    fn nat_learning_rejects_gaps_late_and_public_sdp() {
+        let src = addr("198.51.100.7:5004");
+        let mut gap = PeerFilter::new("10.0.0.2".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        for seq in [1u16, 2, 4, 5, 6, 8, 9] {
+            assert_eq!(gap.check(src, &header(3, seq), Duration::from_secs(1)), Verdict::Drop);
+        }
+        let mut late = PeerFilter::new("10.0.0.2".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        for seq in 0..20 {
+            assert_eq!(late.check(src, &header(3, seq), Duration::from_secs(30)), Verdict::Drop);
+        }
+        // A publicly routable SDP address means "no NAT": never learn a different IP.
+        let mut public = PeerFilter::new("203.0.113.5".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        for seq in 0..20 {
+            assert_eq!(public.check(src, &header(3, seq), Duration::from_secs(1)), Verdict::Drop);
+        }
     }
 }

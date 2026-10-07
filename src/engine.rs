@@ -104,6 +104,7 @@ impl Session {
             dialog_layer,
             account: account.clone(),
             local_ip,
+            server_ip: server_addr.ip(),
             events: events.clone(),
             slot,
         };
@@ -249,7 +250,16 @@ async fn incoming_loop(
             continue;
         }
         match transaction.original.method() {
-            Method::Invite => call::start_incoming(ctx.clone(), transaction),
+            Method::Invite => {
+                // UDP source addresses can be forged, but a stranger should not be able to make
+                // the phone ring with an arbitrary caller name: only the server we registered
+                // with may send us calls.
+                if request_source_ip(&transaction.original) == Some(ctx.server_ip) {
+                    call::start_incoming(ctx.clone(), transaction);
+                } else {
+                    let _ = transaction.reply(StatusCode::Forbidden).await;
+                }
+            }
             Method::Options => {
                 let _ = transaction.reply(StatusCode::OK).await;
             }
@@ -263,5 +273,50 @@ async fn incoming_loop(
                 let _ = transaction.reply(StatusCode::NotImplemented).await;
             }
         }
+    }
+}
+
+/// Where the request really came from. The stack strips any `received` value a sender put in
+/// the top Via and writes the actual source itself; it leaves it out only when the sent-by
+/// host already equals the source, so the sent-by IP is the fallback.
+fn request_source_ip(request: &rsipstack::sip::Request) -> Option<std::net::IpAddr> {
+    use rsipstack::sip::prelude::{HeadersExt, ToTypedHeader};
+    let via = request.via_header().ok()?.typed().ok()?;
+    via.params
+        .iter()
+        .find_map(|param| match param {
+            rsipstack::sip::Param::Received(received) => received.to_string().parse().ok(),
+            _ => None,
+        })
+        .or_else(|| via.uri.host_with_port.host.to_string().parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn invite(via: &str) -> rsipstack::sip::Request {
+        let raw = format!(
+            "INVITE sip:300@203.0.113.9 SIP/2.0\r\nVia: {via}\r\nFrom: <sip:100@x>;tag=1\r\nTo: <sip:300@x>\r\nCall-ID: abc\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+        );
+        rsipstack::sip::Request::try_from(raw.as_str()).expect("valid request")
+    }
+
+    #[test]
+    fn source_is_received_param_when_present() {
+        let req = invite("SIP/2.0/UDP 10.0.0.5:5060;branch=z9hG4bK1;received=203.0.113.9");
+        assert_eq!(request_source_ip(&req), Some("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn source_falls_back_to_sent_by_ip() {
+        let req = invite("SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bK1");
+        assert_eq!(request_source_ip(&req), Some("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn unknown_source_is_not_trusted() {
+        let req = invite("SIP/2.0/UDP pbx.example.com:5060;branch=z9hG4bK1");
+        assert_eq!(request_source_ip(&req), None);
     }
 }

@@ -72,6 +72,8 @@ pub struct CallContext {
     pub dialog_layer: Arc<DialogLayer>,
     pub account: Arc<Account>,
     pub local_ip: IpAddr,
+    /// Address of the SIP server; media from it is trusted.
+    pub server_ip: IpAddr,
     pub events: Events,
     pub slot: Arc<CallSlot>,
 }
@@ -447,6 +449,7 @@ async fn talk(
             muted: muted.clone(),
             dtmf: dtmf_rx,
         },
+        ctx.server_ip,
         stop.clone(),
     ));
 
