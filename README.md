@@ -19,6 +19,23 @@ Sign in to your PBX, dial a number, answer calls — on macOS, Windows and Linux
 
 ---
 
+## 📸 Screenshots
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/screenshots/sign-in.png" alt="Sign-in screen" width="200"><br><sub><b>Sign in</b><br>station, number, password</sub></td>
+    <td align="center"><img src="docs/screenshots/dial.png" alt="Dialer" width="200"><br><sub><b>Dial</b><br>keypad or keyboard</sub></td>
+    <td align="center"><img src="docs/screenshots/recent.png" alt="Recent calls" width="200"><br><sub><b>Recent</b><br>incoming, outgoing, missed</sub></td>
+    <td align="center"><img src="docs/screenshots/incoming-call.png" alt="Incoming call" width="200"><br><sub><b>Incoming call</b><br>answer or decline</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/screenshots/ringing.png" alt="Outgoing call ringing" width="200"><br><sub><b>Calling</b><br>cancel at any time</sub></td>
+    <td align="center"><img src="docs/screenshots/muted.png" alt="Call with the microphone muted" width="200"><br><sub><b>In a call</b><br>timer, mute, hang up</sub></td>
+    <td align="center"><img src="docs/screenshots/keypad.png" alt="Keypad tones during a call" width="200"><br><sub><b>Keypad tones</b><br>for voice menus</sub></td>
+    <td></td>
+  </tr>
+</table>
+
 ## ✨ Features
 
 - **Outgoing and incoming calls** over SIP, with digest authentication.
