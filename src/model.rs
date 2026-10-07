@@ -136,6 +136,8 @@ pub struct CallView {
     pub remote_hold: bool,
     /// A transfer has been requested and not yet confirmed.
     pub transferring: bool,
+    /// The microphone is switched off by the user (or was left off by auto-answer).
+    pub muted: bool,
 }
 
 impl CallView {
@@ -147,6 +149,7 @@ impl CallView {
             local_hold: false,
             remote_hold: false,
             transferring: false,
+            muted: false,
         }
     }
 }

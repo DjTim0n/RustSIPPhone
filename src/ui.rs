@@ -62,7 +62,6 @@ pub struct PhoneApp {
     tab: Tab,
     number: String,
     call: Option<CallView>,
-    muted: bool,
     keypad_open: bool,
     /// The transfer panel of the call screen is open, with the target typed so far.
     transfer_open: bool,
@@ -116,7 +115,6 @@ impl PhoneApp {
             tab: Tab::Dial,
             number: String::new(),
             call: None,
-            muted: false,
             keypad_open: false,
             transfer_open: false,
             transfer_target: String::new(),
@@ -226,7 +224,6 @@ impl PhoneApp {
                         }
                     }
                     if view.is_none() || self.call.is_none() {
-                        self.muted = false;
                         self.keypad_open = false;
                         self.transfer_open = false;
                         self.transfer_target.clear();
@@ -961,16 +958,15 @@ impl PhoneApp {
                 // Two rows of two buttons: mute and hold, keypad and transfer.
                 let rect = ui.allocate_space(vec2(ui.available_width(), 44.0)).1;
                 let (left, right) = split_row(rect, 12.0);
-                let mute_label = if self.muted {
+                let mute_label = if call.muted {
                     l.t("Unmute", "Включить микрофон")
                 } else {
                     l.t("Mute", "Без звука")
                 };
-                let mute_fill = if self.muted { AMBER } else { SURFACE_HI };
-                let mute_text = if self.muted { Color32::BLACK } else { TEXT };
+                let mute_fill = if call.muted { AMBER } else { SURFACE_HI };
+                let mute_text = if call.muted { Color32::BLACK } else { TEXT };
                 if pill_in(ui, left, "mute", mute_fill, mute_label, mute_text, true) {
-                    self.muted = !self.muted;
-                    self.send(Command::SetMute(self.muted));
+                    self.send(Command::SetMute(!call.muted));
                 }
                 let hold_label = if call.local_hold {
                     l.t("Resume", "Вернуть")

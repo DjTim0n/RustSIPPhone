@@ -541,8 +541,8 @@ impl PhoneApp {
             ui,
             l.t("Answer automatically", "Отвечать автоматически"),
             l.t(
-                "Picks up after a moment. Handy for a headset or an intercom.",
-                "Снимает трубку через мгновение. Удобно для гарнитуры или селектора.",
+                "Picks up after a moment. The microphone stays off until you switch it on.",
+                "Снимает трубку через мгновение. Микрофон остаётся выключенным, пока вы его не включите.",
             ),
             &mut draft.calls.auto_answer,
         );

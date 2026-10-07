@@ -319,7 +319,18 @@ async fn outgoing(
                 (None, None) => None,
             };
             match media {
-                Some(media) => talk(ctx, &dialog, number, media, &mut state_rx, &mut ctl_rx).await,
+                Some(media) => {
+                    talk(
+                        ctx,
+                        &dialog,
+                        number,
+                        media,
+                        false,
+                        &mut state_rx,
+                        &mut ctl_rx,
+                    )
+                    .await
+                }
                 None => {
                     let _ = dialog.bye().await;
                     Finished::failed(Notice::SoundSetupFailed("no audio device".into()))
@@ -441,7 +452,7 @@ async fn incoming(
     let decision = tokio::time::timeout(INCOMING_RING_TIMEOUT, async {
         loop {
             tokio::select! {
-                _ = &mut auto_answer_timer, if auto_answer => return Decision::Answer,
+                _ = &mut auto_answer_timer, if auto_answer => return Decision::AutoAnswer,
                 ctl = ctl_rx.recv() => match ctl {
                     Some(CallCtl::Answer) => return Decision::Answer,
                     Some(CallCtl::Reject | CallCtl::Hangup) => return Decision::Decline,
@@ -460,7 +471,7 @@ async fn incoming(
     drop(ringtone);
 
     match decision {
-        Ok(Decision::Answer) => {}
+        Ok(Decision::Answer | Decision::AutoAnswer) => {}
         Ok(Decision::Decline) => {
             let _ = dialog.reject(Some(StatusCode::Decline), None);
             ctx.dialog_layer.remove_dialog(&dialog.id());
@@ -516,13 +527,26 @@ async fn incoming(
     }
 
     let media = start_media(ctx, rtp_socket, audio, remote, false, session_id);
-    let result = talk(ctx, &dialog, peer, media, &mut state_rx, &mut ctl_rx).await;
+    let start_muted = matches!(decision, Ok(Decision::AutoAnswer));
+    let result = talk(
+        ctx,
+        &dialog,
+        peer,
+        media,
+        start_muted,
+        &mut state_rx,
+        &mut ctl_rx,
+    )
+    .await;
     ctx.dialog_layer.remove_dialog(&dialog.id());
     result
 }
 
 enum Decision {
     Answer,
+    /// The phone picked up by itself. The microphone stays off until the user switches it on:
+    /// nobody agreed to be listened to.
+    AutoAnswer,
     Decline,
     CallerGaveUp,
 }
@@ -627,6 +651,19 @@ struct CallFlags {
 }
 
 impl CallFlags {
+    fn new(peer: &str, connected_at: Instant, session_id: u64, muted: bool) -> Self {
+        CallFlags {
+            user_muted: muted,
+            view: CallView {
+                connected_at: Some(connected_at),
+                muted,
+                ..CallView::new(peer, Phase::Active)
+            },
+            sdp_version: session_id,
+            transfer: None,
+        }
+    }
+
     fn publish(&self, ctx: &CallContext) {
         ctx.events.send(Event::Call(Some(self.view.clone())));
     }
@@ -644,19 +681,12 @@ async fn talk(
     dialog: &InviteDialog,
     peer: &str,
     mut media: RunningMedia,
+    start_muted: bool,
     state_rx: &mut UnboundedReceiver<DialogState>,
     ctl_rx: &mut UnboundedReceiver<CallCtl>,
 ) -> Finished {
     let connected_at = Instant::now();
-    let mut flags = CallFlags {
-        user_muted: false,
-        view: CallView {
-            connected_at: Some(connected_at),
-            ..CallView::new(peer, Phase::Active)
-        },
-        sdp_version: media.session_id,
-        transfer: None,
-    };
+    let mut flags = CallFlags::new(peer, connected_at, media.session_id, start_muted);
     flags.publish(ctx);
     // The call is answered: from now on the other side hears us.
     flags.apply_mute(&media);
@@ -671,7 +701,9 @@ async fn talk(
                 }
                 Some(CallCtl::Mute(on)) => {
                     flags.user_muted = on;
+                    flags.view.muted = on;
                     flags.apply_mute(&media);
+                    flags.publish(ctx);
                 }
                 Some(CallCtl::Dtmf(digit)) => send_dtmf(ctx, dialog, &media, digit).await,
                 Some(CallCtl::Hold(on)) => {
@@ -704,7 +736,9 @@ async fn talk(
                 }
                 Some(DialogState::Notify(_, request, handle)) => {
                     let _ = handle.reply(rsipstack::sip::StatusCode::OK).await;
-                    if let Some(code) = sipfrag_status(&request) {
+                    if is_refer_notify(&request)
+                        && let Some(code) = sipfrag_status(&request)
+                    {
                         if let Some(done) = flags.transfer_progress(ctx, code) {
                             let _ = dialog.bye().await;
                             break Some(done);
@@ -834,6 +868,18 @@ async fn request_transfer(
         Ok(Some(response)) => Err(response.status_code.code()),
         Ok(None) | Err(_) => Err(0),
     }
+}
+
+/// Whether a NOTIFY reports on a transfer (`Event: refer`). Other notifications are none of the
+/// transfer's business.
+fn is_refer_notify(request: &rsipstack::sip::Request) -> bool {
+    request.headers.iter().any(|header| match header {
+        rsipstack::sip::Header::Event(event) => event.to_string().to_lowercase().contains("refer"),
+        rsipstack::sip::Header::Other(name, value) => {
+            name.eq_ignore_ascii_case("Event") && value.to_lowercase().contains("refer")
+        }
+        _ => false,
+    })
 }
 
 /// The status line of a transfer progress report: the body of the NOTIFY is a fragment of a SIP
@@ -1166,5 +1212,31 @@ mod tests {
     fn keypad_tones_for_info_use_the_dtmf_relay_format() {
         assert_eq!(dtmf_relay_body('5'), "Signal=5\r\nDuration=160\r\n");
         assert_eq!(dtmf_relay_body('#'), "Signal=#\r\nDuration=160\r\n");
+    }
+
+    #[test]
+    fn an_auto_answered_call_starts_with_the_microphone_off() {
+        let flags = CallFlags::new("100", Instant::now(), 77, true);
+        assert!(
+            flags.user_muted && flags.view.muted,
+            "nobody agreed to be listened to"
+        );
+        let normal = CallFlags::new("100", Instant::now(), 77, false);
+        assert!(!normal.user_muted && !normal.view.muted);
+    }
+
+    #[test]
+    fn only_transfer_reports_count_as_transfer_progress() {
+        let notify = |event: &str| {
+            let raw = format!(
+                "NOTIFY sip:300@10.0.0.5 SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK9\r\n\
+                 From: <sip:100@x>;tag=remote\r\nTo: <sip:300@x>;tag=local\r\nCall-ID: call-1\r\n\
+                 CSeq: 3 NOTIFY\r\nEvent: {event}\r\nContent-Length: 0\r\n\r\n"
+            );
+            rsipstack::sip::Request::try_from(raw.as_str()).expect("valid request")
+        };
+        assert!(is_refer_notify(&notify("refer")));
+        assert!(is_refer_notify(&notify("refer;id=4")));
+        assert!(!is_refer_notify(&notify("message-summary")));
     }
 }

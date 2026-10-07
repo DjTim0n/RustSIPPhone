@@ -480,6 +480,13 @@ async fn incoming_loop(
     while let Some(mut transaction) = incoming.recv().await {
         // Requests inside a dialog (BYE from the other side etc.) go to the dialog itself.
         if let Some(mut dialog) = ctx.dialog_layer.match_dialog(&transaction) {
+            // Like a new call, a request inside a call must come over the transport the account
+            // uses: a hang-up or hold forged over plain UDP must not reach a call that runs over
+            // TLS.
+            if !transport_matches(&transaction.original, ctx.account.connection.transport) {
+                let _ = transaction.reply(StatusCode::Forbidden).await;
+                continue;
+            }
             let _ = dialog.handle(&mut transaction).await;
             continue;
         }
@@ -493,8 +500,8 @@ async fn incoming_loop(
                 // The phone also keeps a plain UDP socket open. A call that did not come over the
                 // transport the account uses (say, UDP when the account uses TLS) is refused, so
                 // a forged packet cannot get around the encrypted channel.
-                let right_transport = request_transport(&transaction.original)
-                    == Some(ctx.account.connection.transport);
+                let right_transport =
+                    transport_matches(&transaction.original, ctx.account.connection.transport);
                 if from_station && right_transport {
                     call::start_incoming(ctx.clone(), transaction);
                 } else {
@@ -567,6 +574,11 @@ impl rsipstack::transaction::endpoint::MessageInspector for SourceStamp {
 fn is_stamp_header(header: &rsipstack::sip::Header) -> bool {
     matches!(header, rsipstack::sip::Header::Other(name, _)
         if name.eq_ignore_ascii_case(SOURCE_HEADER) || name.eq_ignore_ascii_case(TRANSPORT_HEADER))
+}
+
+/// Whether the request arrived over `expected` (as stamped on arrival).
+fn transport_matches(request: &rsipstack::sip::Request, expected: TransportKind) -> bool {
+    request_transport(request) == Some(expected)
 }
 
 fn transport_kind(transport: rsipstack::sip::Transport) -> Option<TransportKind> {
@@ -668,6 +680,24 @@ mod tests {
 
         endpoint.shutdown();
         let _ = serve.await;
+    }
+
+    #[test]
+    fn requests_must_arrive_over_the_accounts_transport() {
+        let stamped = |transport: &str| {
+            let raw = format!(
+                "BYE sip:300@x SIP/2.0\r\nVia: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bK1\r\n\
+                 From: <sip:1@x>;tag=1\r\nTo: <sip:300@x>;tag=2\r\nCall-ID: a\r\nCSeq: 1 BYE\r\n\
+                 X-Verified-Transport: {transport}\r\nContent-Length: 0\r\n\r\n"
+            );
+            rsipstack::sip::Request::try_from(raw.as_str()).expect("valid request")
+        };
+        assert!(transport_matches(&stamped("TLS"), TransportKind::Tls));
+        assert!(
+            !transport_matches(&stamped("UDP"), TransportKind::Tls),
+            "downgrade refused"
+        );
+        assert!(!transport_matches(&stamped("TLS"), TransportKind::Udp));
     }
 
     #[test]
