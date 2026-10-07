@@ -45,6 +45,7 @@ Sign in to your PBX, dial a number, answer calls — on macOS, Windows and Linux
 - **Station by name or by IP.** Type a host name and the phone finds the station through its DNS records (SRV, RFC 3263), or enter an IP address and a port yourself.
 - **Settings for real setups:** SIP domain, outbound proxy, registration time, display name, an extra certificate for private TLS, and an option to advertise your public address behind a router (NAT).
 - **Choose your microphone and speaker** in **Settings → Audio**; the ringtone follows the speaker.
+- **Hear the call ring.** You get a ringback tone while the other phone rings, and the station's own tones or music when it sends them before the answer (early media).
 - **Recent calls** — incoming, outgoing and missed, one click to call back.
 - **In-call controls** — mute, keypad tones (DTMF) for voice menus, hang up.
 - **Ringtone** that plays on every platform, with nothing extra to install.
@@ -58,11 +59,11 @@ Grab the package for your system from the **[latest release](https://github.com/
 
 | System | Package | What's inside |
 | --- | --- | --- |
-| 🍎 **macOS** 11+ (Apple Silicon and Intel) | [`RustSIPPhone-1.0.3.dmg`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.3/RustSIPPhone-1.0.3.dmg) | Disk image with `RustSIPPhone.app` |
-| 🪟 **Windows** 10+ (64-bit) | [`RustSIPPhone-windows.zip`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.3/RustSIPPhone-windows.zip) | `rust_sip_phone.exe` |
-| 🐧 **Linux** (x86_64) | [`RustSIPPhone-linux-x86_64.tar.gz`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.3/RustSIPPhone-linux-x86_64.tar.gz) | Binary, desktop entry and icon |
+| 🍎 **macOS** 11+ (Apple Silicon and Intel) | [`RustSIPPhone-1.1.0.dmg`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.1.0/RustSIPPhone-1.1.0.dmg) | Disk image with `RustSIPPhone.app` |
+| 🪟 **Windows** 10+ (64-bit) | [`RustSIPPhone-windows.zip`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.1.0/RustSIPPhone-windows.zip) | `rust_sip_phone.exe` |
+| 🐧 **Linux** (x86_64) | [`RustSIPPhone-linux-x86_64.tar.gz`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.1.0/RustSIPPhone-linux-x86_64.tar.gz) | Binary, desktop entry and icon |
 
-Every release also includes [`SHA256SUMS.txt`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.3/SHA256SUMS.txt) so you can [verify your download](#-verify-your-download).
+Every release also includes [`SHA256SUMS.txt`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.1.0/SHA256SUMS.txt) so you can [verify your download](#-verify-your-download).
 
 ## 🚀 Quick start
 
@@ -193,14 +194,14 @@ cargo test
 | Target | Command | Result |
 | --- | --- | --- |
 | macOS `.app` | `./scripts/bundle-macos.sh` | `dist/RustSIPPhone.app` |
-| macOS `.app` + `.dmg` | `./scripts/bundle-macos.sh --dmg` | `dist/RustSIPPhone-1.0.3.dmg` |
+| macOS `.app` + `.dmg` | `./scripts/bundle-macos.sh --dmg` | `dist/RustSIPPhone-1.1.0.dmg` |
 | macOS universal (Intel + Apple Silicon) | `./scripts/bundle-macos.sh --universal --dmg` | one app for both |
 | macOS signed and notarized | `./scripts/bundle-macos.sh --universal --dmg --notarize` | ready to distribute |
 | Windows / Linux | `cargo build --release` | `target/release/rust_sip_phone[.exe]` |
 
 By default the app gets an ad-hoc signature, which is enough on your own Mac. To distribute it, sign with your own Apple Developer ID: set `SIGN_IDENTITY="Developer ID Application: …"`, or pass `--notarize`, which finds the certificate in your keychain, sends the app and the disk image to Apple and staples the result. Notarization needs credentials; the header of [`scripts/bundle-macos.sh`](scripts/bundle-macos.sh) shows the three ways to supply them.
 
-Releases are built by [GitHub Actions](.github/workflows/build.yml) on macOS, Windows and Linux. Push a tag like `v1.0.3` and the workflow publishes the packages and checksums. On tags (and manual runs) the macOS build is signed and notarized when these repository secrets exist: `APPLE_CERTIFICATE_P12` (base64), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD`.
+Releases are built by [GitHub Actions](.github/workflows/build.yml) on macOS, Windows and Linux. Push a tag like `v1.1.0` and the workflow publishes the packages and checksums. On tags (and manual runs) the macOS build is signed and notarized when these repository secrets exist: `APPLE_CERTIFICATE_P12` (base64), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD`.
 
 ## 🧭 How it works
 
