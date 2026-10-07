@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Account {
     /// Station (PBX) address as typed: a name or an IP, with an optional port.
     pub server: String,
@@ -15,6 +15,18 @@ pub struct Account {
     pub extension: String,
     pub password: String,
     pub connection: ConnectionSettings,
+}
+
+/// `Debug` must never print the password: it would end up in logs and bug reports.
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Account")
+            .field("server", &self.server)
+            .field("extension", &self.extension)
+            .field("password", &"<hidden>")
+            .field("connection", &self.connection)
+            .finish()
+    }
 }
 
 impl Account {
@@ -227,6 +239,15 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_password() {
+        let mut a = account("pbx.example.com", "", TransportKind::Udp);
+        a.password = "hunter2-secret".into();
+        let text = format!("{a:?} {:?}", Command::Register(a.clone()));
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("<hidden>"));
     }
 
     #[test]

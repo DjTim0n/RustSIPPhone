@@ -472,9 +472,14 @@ async fn incoming_loop(
                 // UDP source addresses can be forged, but a stranger should not be able to make
                 // the phone ring with an arbitrary caller name: only the server we registered
                 // with may send us calls.
-                if request_source_ip(&transaction.original)
-                    .is_some_and(|ip| ctx.server_ips.contains(&ip))
-                {
+                let from_station = request_source_ip(&transaction.original)
+                    .is_some_and(|ip| ctx.server_ips.contains(&ip));
+                // The phone also keeps a plain UDP socket open. A call that did not come over the
+                // transport the account uses (say, UDP when the account uses TLS) is refused, so
+                // a forged packet cannot get around the encrypted channel.
+                let right_transport = request_transport(&transaction.original)
+                    == Some(ctx.account.connection.transport);
+                if from_station && right_transport {
                     call::start_incoming(ctx.clone(), transaction);
                 } else {
                     let _ = transaction.reply(StatusCode::Forbidden).await;
@@ -499,6 +504,8 @@ async fn incoming_loop(
 /// Header the transport layer stamps on every received request with the address the packet
 /// really came from. Anything a sender puts under this name is discarded first.
 const SOURCE_HEADER: &str = "X-Verified-Source";
+/// The transport the request arrived over, stamped the same way.
+const TRANSPORT_HEADER: &str = "X-Verified-Transport";
 
 /// Message inspector that records the true UDP source of each incoming request.
 ///
@@ -523,20 +530,53 @@ impl rsipstack::transaction::endpoint::MessageInspector for SourceStamp {
         from: Option<&rsipstack::transport::SipAddr>,
     ) -> rsipstack::sip::SipMessage {
         if let rsipstack::sip::SipMessage::Request(request) = &mut msg {
-            request.headers.retain(|header| !is_source_header(header));
+            request.headers.retain(|header| !is_stamp_header(header));
             if let Some(from) = from {
                 request.headers.push(rsipstack::sip::Header::Other(
                     SOURCE_HEADER.to_string(),
                     from.addr.host.to_string(),
                 ));
+                if let Some(transport) = from.r#type.and_then(transport_kind) {
+                    request.headers.push(rsipstack::sip::Header::Other(
+                        TRANSPORT_HEADER.to_string(),
+                        transport.label().to_string(),
+                    ));
+                }
             }
         }
         msg
     }
 }
 
-fn is_source_header(header: &rsipstack::sip::Header) -> bool {
-    matches!(header, rsipstack::sip::Header::Other(name, _) if name.eq_ignore_ascii_case(SOURCE_HEADER))
+fn is_stamp_header(header: &rsipstack::sip::Header) -> bool {
+    matches!(header, rsipstack::sip::Header::Other(name, _)
+        if name.eq_ignore_ascii_case(SOURCE_HEADER) || name.eq_ignore_ascii_case(TRANSPORT_HEADER))
+}
+
+fn transport_kind(transport: rsipstack::sip::Transport) -> Option<TransportKind> {
+    use rsipstack::sip::Transport;
+    match transport {
+        Transport::Udp => Some(TransportKind::Udp),
+        Transport::Tcp => Some(TransportKind::Tcp),
+        Transport::Tls => Some(TransportKind::Tls),
+        Transport::Ws => Some(TransportKind::Ws),
+        Transport::Wss => Some(TransportKind::Wss),
+        Transport::Sctp | Transport::TlsSctp => None,
+    }
+}
+
+/// The transport a request really arrived over, or `None` if it was not stamped.
+fn request_transport(request: &rsipstack::sip::Request) -> Option<TransportKind> {
+    request.headers.iter().find_map(|header| match header {
+        rsipstack::sip::Header::Other(name, value)
+            if name.eq_ignore_ascii_case(TRANSPORT_HEADER) =>
+        {
+            TransportKind::ALL
+                .into_iter()
+                .find(|kind| kind.label().eq_ignore_ascii_case(value.trim()))
+        }
+        _ => None,
+    })
 }
 
 /// The IP a request really came from, or `None` if it was not stamped (treated as untrusted).
@@ -558,6 +598,7 @@ mod tests {
         Via: SIP/2.0/UDP 127.0.0.1:5999;branch=z9hG4bK1;received=203.0.113.9\r\n\
         Via: SIP/2.0/UDP 10.0.0.1;received=203.0.113.9\r\n\
         X-Verified-Source: 203.0.113.9\r\n\
+        X-Verified-Transport: TLS\r\n\
         x-verified-source: 203.0.113.9\r\n\
         From: <sip:100@x>;tag=1\r\nTo: <sip:300@x>\r\nCall-ID: forged-1\r\n\
         CSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
@@ -597,9 +638,17 @@ mod tests {
             .original
             .headers
             .iter()
-            .filter(|h| is_source_header(h))
+            .filter(|h| is_stamp_header(h))
             .count();
-        assert_eq!(stamps, 1, "forged copies must be removed");
+        assert_eq!(
+            stamps, 2,
+            "forged copies must be removed: one source and one transport stamp"
+        );
+        // The packet came over UDP, whatever the sender claims.
+        assert_eq!(
+            request_transport(&transaction.original),
+            Some(TransportKind::Udp)
+        );
 
         endpoint.shutdown();
         let _ = serve.await;
