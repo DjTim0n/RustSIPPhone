@@ -56,7 +56,7 @@ pub fn build_offer(local_ip: IpAddr, rtp_port: u16, session_id: u64) -> String {
     )
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Remote {
     pub addr: SocketAddr,
     pub codec: Codec,

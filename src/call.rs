@@ -3,7 +3,7 @@
 use crate::audio::AudioIo;
 use crate::media::{self, MediaControl};
 use crate::model::*;
-use crate::ringtone::Ringtone;
+use crate::ringtone::{Ringtone, Tone};
 use crate::sdp;
 use crate::settings::AudioSettings;
 use rsipstack::dialog::authenticate::Credential;
@@ -231,6 +231,12 @@ async fn outgoing(
     let invite_future = ctx.dialog_layer.do_invite(invite, state_tx);
     tokio::pin!(invite_future);
 
+    // While the other phone rings we either hear the station's own sound (early media) or, if it
+    // sends none, a ringback tone of our own.
+    let mut audio = Some(audio);
+    let mut early: Option<RunningMedia> = None;
+    let mut ringback: Option<Ringtone> = None;
+
     let (dialog, response) = loop {
         tokio::select! {
             result = &mut invite_future => match result {
@@ -238,8 +244,20 @@ async fn outgoing(
                 Err(_) => return Finished::failed(Notice::ServerNotResponding),
             },
             Some(state) = state_rx.recv() => {
-                if matches!(state, DialogState::Early(..)) {
+                if let DialogState::Early(_, provisional) = &state {
                     publish(ctx, number, Phase::Ringing);
+                    if early.is_none() {
+                        match early_remote(provisional) {
+                            Some(remote) => {
+                                if let Some(audio) = audio.take() {
+                                    ringback = None;
+                                    early = Some(start_media(ctx, rtp_socket.clone(), audio, remote, true));
+                                }
+                            }
+                            None if ringback.is_none() => ringback = start_ringback(ctx).await,
+                            None => {}
+                        }
+                    }
                 }
             }
             ctl = ctl_rx.recv() => match ctl {
@@ -260,19 +278,32 @@ async fn outgoing(
         return Finished::without_talk(Outcome::Failed, Some(Notice::CallRejected(code)));
     }
 
+    drop(ringback);
     let result = match response_body(&response).and_then(|body| sdp::parse_remote(&body)) {
         Ok(remote) => {
-            talk(
-                ctx,
-                &dialog,
-                number,
-                remote,
-                rtp_socket,
-                audio,
-                &mut state_rx,
-                &mut ctl_rx,
-            )
-            .await
+            let media = match (early.take(), audio.take()) {
+                // The station's early media already runs to the right place: just turn the
+                // microphone on.
+                (Some(media), _) if media.remote == remote => Some(media),
+                // It changed its mind about where the audio goes: start over with fresh devices.
+                (Some(stale), _) => {
+                    drop(stale);
+                    AudioIo::start(&ctx.audio_settings()).ok().map(|audio| {
+                        start_media(ctx, rtp_socket.clone(), audio, remote.clone(), false)
+                    })
+                }
+                (None, Some(audio)) => {
+                    Some(start_media(ctx, rtp_socket.clone(), audio, remote, false))
+                }
+                (None, None) => None,
+            };
+            match media {
+                Some(media) => talk(ctx, &dialog, number, media, &mut state_rx, &mut ctl_rx).await,
+                None => {
+                    let _ = dialog.bye().await;
+                    Finished::failed(Notice::SoundSetupFailed("no audio device".into()))
+                }
+            }
         }
         Err(err) => {
             let _ = dialog.bye().await;
@@ -370,10 +401,11 @@ async fn incoming(
     publish(ctx, peer, Phase::Incoming);
     // No speaker, or the tone failed to start: the call is still visible on screen.
     let output_device = ctx.audio_settings().output_device;
-    let ringtone = tokio::task::spawn_blocking(move || Ringtone::start(output_device.as_deref()))
-        .await
-        .ok()
-        .and_then(Result::ok);
+    let ringtone =
+        tokio::task::spawn_blocking(move || Ringtone::start(output_device.as_deref(), Tone::Ring))
+            .await
+            .ok()
+            .and_then(Result::ok);
 
     let decision = tokio::time::timeout(INCOMING_RING_TIMEOUT, async {
         loop {
@@ -448,17 +480,8 @@ async fn incoming(
         return Finished::failed(Notice::AnswerFailed);
     }
 
-    let result = talk(
-        ctx,
-        &dialog,
-        peer,
-        remote,
-        rtp_socket,
-        audio,
-        &mut state_rx,
-        &mut ctl_rx,
-    )
-    .await;
+    let media = start_media(ctx, rtp_socket, audio, remote, false);
+    let result = talk(ctx, &dialog, peer, media, &mut state_rx, &mut ctl_rx).await;
     ctx.dialog_layer.remove_dialog(&dialog.id());
     result
 }
@@ -469,16 +492,85 @@ enum Decision {
     CallerGaveUp,
 }
 
+// ----------------------------------------------------------------- media
+
+/// The audio of a call: it starts as soon as the other side sends sound (early media, when the
+/// station plays its own ringback tone or music while the phone is still ringing) and goes on as
+/// the conversation. Dropping it stops the audio and closes the devices.
+struct RunningMedia {
+    stop: CancellationToken,
+    task: Option<tokio::task::JoinHandle<media::MediaStats>>,
+    /// While true the microphone is replaced by silence.
+    muted: Arc<AtomicBool>,
+    dtmf: UnboundedSender<char>,
+    remote: sdp::Remote,
+}
+
+impl Drop for RunningMedia {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+/// Starts sending and receiving audio. `muted` keeps the microphone off, which is what the phone
+/// does until the other side has answered: audio is received and silence is sent.
+fn start_media(
+    ctx: &CallContext,
+    rtp_socket: Arc<UdpSocket>,
+    audio: AudioIo,
+    remote: sdp::Remote,
+    muted: bool,
+) -> RunningMedia {
+    let muted = Arc::new(AtomicBool::new(muted));
+    let (dtmf_tx, dtmf_rx) = unbounded_channel();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(media::run(
+        rtp_socket,
+        remote.clone(),
+        audio,
+        MediaControl {
+            muted: muted.clone(),
+            dtmf: dtmf_rx,
+        },
+        ctx.server_ips.to_vec(),
+        stop.clone(),
+    ));
+    RunningMedia {
+        stop,
+        task: Some(task),
+        muted,
+        dtmf: dtmf_tx,
+        remote,
+    }
+}
+
+/// Where early media comes from, if this provisional response carries a session description.
+fn early_remote(response: &rsipstack::sip::Response) -> Option<sdp::Remote> {
+    if response.body().is_empty() {
+        return None;
+    }
+    response_body(response)
+        .and_then(|body| sdp::parse_remote(&body))
+        .ok()
+}
+
+/// Plays the ringback tone on the chosen speaker. No speaker or a failure means silence, which is
+/// better than failing the call.
+async fn start_ringback(ctx: &CallContext) -> Option<Ringtone> {
+    let output_device = ctx.audio_settings().output_device;
+    tokio::task::spawn_blocking(move || Ringtone::start(output_device.as_deref(), Tone::Ringback))
+        .await
+        .ok()
+        .and_then(Result::ok)
+}
+
 // ----------------------------------------------------------------- conversation
 
-#[allow(clippy::too_many_arguments)]
 async fn talk(
     ctx: &CallContext,
     dialog: &InviteDialog,
     peer: &str,
-    remote: sdp::Remote,
-    rtp_socket: Arc<UdpSocket>,
-    audio: AudioIo,
+    mut media: RunningMedia,
     state_rx: &mut UnboundedReceiver<DialogState>,
     ctl_rx: &mut UnboundedReceiver<CallCtl>,
 ) -> Finished {
@@ -488,21 +580,8 @@ async fn talk(
         phase: Phase::Active,
         connected_at: Some(connected_at),
     })));
-
-    let muted = Arc::new(AtomicBool::new(false));
-    let (dtmf_tx, dtmf_rx) = unbounded_channel();
-    let stop = CancellationToken::new();
-    let media_task = tokio::spawn(media::run(
-        rtp_socket,
-        remote,
-        audio,
-        MediaControl {
-            muted: muted.clone(),
-            dtmf: dtmf_rx,
-        },
-        ctx.server_ips.to_vec(),
-        stop.clone(),
-    ));
+    // The call is answered: from now on the other side hears us.
+    media.muted.store(false, Ordering::Relaxed);
 
     let message = loop {
         tokio::select! {
@@ -511,8 +590,8 @@ async fn talk(
                     let _ = dialog.bye().await;
                     break None;
                 }
-                Some(CallCtl::Mute(on)) => muted.store(on, Ordering::Relaxed),
-                Some(CallCtl::Dtmf(digit)) => { let _ = dtmf_tx.send(digit); }
+                Some(CallCtl::Mute(on)) => media.muted.store(on, Ordering::Relaxed),
+                Some(CallCtl::Dtmf(digit)) => { let _ = media.dtmf.send(digit); }
                 Some(CallCtl::Answer) => {}
             },
             state = state_rx.recv() => match state {
@@ -524,8 +603,11 @@ async fn talk(
         }
     };
 
-    stop.cancel();
-    let stats = media_task.await.unwrap_or_default();
+    media.stop.cancel();
+    let stats = match media.task.take() {
+        Some(task) => task.await.unwrap_or_default(),
+        None => media::MediaStats::default(),
+    };
     // If no audio packet arrived for a noticeable time, the network is most likely blocking it.
     let silent = stats.received == 0 && connected_at.elapsed() > Duration::from_secs(5);
     let notice = match (message, silent) {
@@ -544,5 +626,42 @@ fn credential(account: &Account) -> Credential {
         username: account.extension.clone(),
         password: account.password.clone(),
         realm: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provisional(status: &str, body: &str) -> rsipstack::sip::Response {
+        let raw = format!(
+            "SIP/2.0 {status}\r\nVia: SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK1\r\n\
+             From: <sip:300@x>;tag=1\r\nTo: <sip:100@x>;tag=2\r\nCall-ID: a\r\nCSeq: 1 INVITE\r\n\
+             Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        rsipstack::sip::Response::try_from(raw.as_str()).expect("valid response")
+    }
+
+    #[test]
+    fn a_183_with_sdp_means_the_station_sends_early_media() {
+        let sdp = "v=0\r\nc=IN IP4 203.0.113.9\r\nm=audio 20000 RTP/AVP 8 101\r\n\
+                   a=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+        let remote = early_remote(&provisional("183 Session Progress", sdp))
+            .expect("early media is announced");
+        assert_eq!(remote.addr, "203.0.113.9:20000".parse().unwrap());
+        assert_eq!(remote.codec, crate::g711::Codec::Pcma);
+    }
+
+    #[test]
+    fn a_plain_180_means_the_phone_plays_its_own_ringback() {
+        assert!(early_remote(&provisional("180 Ringing", "")).is_none());
+    }
+
+    #[test]
+    fn unusable_sdp_does_not_count_as_early_media() {
+        // No common codec: better to fall back to our own ringback tone than to hear nothing.
+        let sdp = "v=0\r\nc=IN IP4 203.0.113.9\r\nm=audio 20000 RTP/AVP 18\r\n";
+        assert!(early_remote(&provisional("183 Session Progress", sdp)).is_none());
     }
 }
