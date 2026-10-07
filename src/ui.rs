@@ -25,8 +25,8 @@ const AMBER: Color32 = Color32::from_rgb(0xE0, 0xA0, 0x30);
 const COLUMN_WIDTH: f32 = 340.0;
 const DIAL_KEYS: [&str; 12] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"];
 const TOAST_LIFETIME: Duration = Duration::from_secs(10);
-const LANG_SWITCH_WIDE: f32 = 176.0;
-const LANG_SWITCH_COMPACT: f32 = 76.0;
+const LANG_SWITCH_WIDE: f32 = 150.0;
+const LANG_SWITCH_COMPACT: f32 = 84.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -292,7 +292,7 @@ impl PhoneApp {
             pos2(switch_row.right() - LANG_SWITCH_WIDE, switch_row.top()),
             vec2(LANG_SWITCH_WIDE, switch_row.height()),
         );
-        if let Some(chosen) = language_switch(ui, switch_rect, l, false) {
+        if let Some(chosen) = language_select(ui, switch_rect, l, false) {
             self.set_language(chosen);
         }
         let l = self.lang();
@@ -467,7 +467,7 @@ impl PhoneApp {
             ),
             vec2(LANG_SWITCH_COMPACT, 32.0),
         );
-        if let Some(chosen) = language_switch(ui, switch_rect, l, true) {
+        if let Some(chosen) = language_select(ui, switch_rect, l, true) {
             self.set_language(chosen);
         }
     }
@@ -999,45 +999,248 @@ fn apply_style(ctx: &egui::Context) {
     });
 }
 
-/// Two-segment language switch. Shows full names, or short codes when `compact`.
-/// Returns the language the user picked this frame, if any.
-fn language_switch(ui: &mut Ui, rect: Rect, current: Lang, compact: bool) -> Option<Lang> {
-    ui.painter().rect_filled(
-        rect,
-        CornerRadius::same((rect.height() / 2.0) as u8),
-        SURFACE,
+/// Width of the open language list.
+const LANG_LIST_WIDTH: f32 = 196.0;
+const LANG_ROW_HEIGHT: f32 = 42.0;
+
+/// Language drop-down (a select), drawn by hand so it matches the rest of the interface.
+///
+/// The closed state is a pill showing the full language name (or a short code when `compact`).
+/// Clicking it opens a list below, right-aligned with the pill: one full-width row per language
+/// with its code, name and a check mark on the current one.
+/// Returns the language the user picked this frame, if it changed.
+fn language_select(ui: &mut Ui, rect: Rect, current: Lang, compact: bool) -> Option<Lang> {
+    let button = ui
+        .interact(rect, ui.id().with(("language", compact)), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&button));
+
+    // The closed pill.
+    let fill = if open || button.hovered() {
+        SURFACE_HI
+    } else {
+        SURFACE
+    };
+    let radius = CornerRadius::same((rect.height() / 2.0) as u8);
+    ui.painter().rect_filled(rect, radius, fill);
+    if open {
+        ui.painter().rect_stroke(
+            rect,
+            radius,
+            Stroke::new(1.0, ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+    ui.painter().text(
+        pos2(rect.left() + 14.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        if compact {
+            current.code()
+        } else {
+            current.name()
+        },
+        FontId::proportional(13.5),
+        TEXT,
     );
-    let segment_width = rect.width() / Lang::ALL.len() as f32;
+    draw_chevron(ui, pos2(rect.right() - 16.0, rect.center().y), open);
+
+    // The open list.
     let mut picked = None;
-    for (i, lang) in Lang::ALL.into_iter().enumerate() {
-        let segment = Rect::from_min_size(
-            pos2(rect.left() + segment_width * i as f32, rect.top()),
-            vec2(segment_width, rect.height()),
-        )
-        .shrink(3.0);
-        let response = ui.interact(
-            segment,
-            ui.id().with(("language", compact, i)),
-            Sense::click(),
-        );
-        let active = lang == current;
-        if active {
-            ui.painter().rect_filled(
-                segment,
-                CornerRadius::same((segment.height() / 2.0) as u8),
-                SURFACE_HI,
-            );
+    let anchor = pos2(rect.right() - LANG_LIST_WIDTH, rect.bottom() + 6.0);
+    let frame = egui::Frame::new()
+        .fill(SURFACE)
+        .stroke(Stroke::new(1.0, SURFACE_HI))
+        .corner_radius(CornerRadius::same(16))
+        .inner_margin(egui::Margin::same(6))
+        .shadow(egui::Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: Color32::from_black_alpha(120),
+        });
+    egui::Popup::from_toggle_button_response(&button)
+        .at_position(anchor)
+        .gap(0.0)
+        .width(LANG_LIST_WIDTH)
+        .frame(frame)
+        .show(|ui| {
+            ui.set_width(LANG_LIST_WIDTH - 12.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for lang in Lang::ALL {
+                if language_row(ui, lang, lang == current) {
+                    picked = Some(lang);
+                }
+            }
+        });
+    picked.filter(|lang| *lang != current)
+}
+
+/// One row of the language list. Returns true when clicked.
+fn language_row(ui: &mut Ui, lang: Lang, selected: bool) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), LANG_ROW_HEIGHT), Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let radius = CornerRadius::same(11);
+    if response.hovered() {
+        ui.painter().rect_filled(rect, radius, SURFACE_HI);
+    } else if selected {
+        ui.painter()
+            .rect_filled(rect, radius, ACCENT.gamma_multiply(0.14));
+    }
+    ui.painter().text(
+        pos2(rect.left() + 14.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        lang.code(),
+        FontId::proportional(12.5),
+        MUTED,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 50.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        lang.name(),
+        FontId::proportional(15.0),
+        TEXT,
+    );
+    if selected {
+        draw_check(ui, pos2(rect.right() - 20.0, rect.center().y));
+    }
+    response.clicked()
+}
+
+/// A small chevron: pointing down when closed, up when open.
+fn draw_chevron(ui: &Ui, center: Pos2, open: bool) {
+    let dy = if open { -2.5 } else { 2.5 };
+    let stroke = Stroke::new(1.6, MUTED);
+    let points = [
+        pos2(center.x - 4.5, center.y - dy),
+        pos2(center.x, center.y + dy),
+        pos2(center.x + 4.5, center.y - dy),
+    ];
+    ui.painter().line_segment([points[0], points[1]], stroke);
+    ui.painter().line_segment([points[1], points[2]], stroke);
+}
+
+/// A check mark in the accent color.
+fn draw_check(ui: &Ui, center: Pos2) {
+    let stroke = Stroke::new(2.0, ACCENT);
+    let a = pos2(center.x - 5.0, center.y + 0.5);
+    let b = pos2(center.x - 1.5, center.y + 4.0);
+    let c = pos2(center.x + 5.5, center.y - 4.0);
+    ui.painter().line_segment([a, b], stroke);
+    ui.painter().line_segment([b, c], stroke);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs the language select in a headless egui context, one frame per call.
+    struct Harness {
+        ctx: egui::Context,
+        frame: u32,
+        rect: Rect,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Harness {
+                ctx: egui::Context::default(),
+                frame: 0,
+                rect: Rect::from_min_size(pos2(200.0, 20.0), vec2(150.0, 32.0)),
+            }
         }
-        ui.painter().text(
-            segment.center(),
-            Align2::CENTER_CENTER,
-            if compact { lang.code() } else { lang.name() },
-            FontId::proportional(if compact { 12.5 } else { 13.5 }),
-            if active { TEXT } else { MUTED },
-        );
-        if response.clicked() {
-            picked = Some(lang);
+
+        fn frame(&mut self, events: Vec<egui::Event>, current: Lang) -> (Option<Lang>, bool) {
+            self.frame += 1;
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 700.0))),
+                time: Some(self.frame as f64 * 0.05),
+                events,
+                ..Default::default()
+            };
+            let rect = self.rect;
+            let mut picked = None;
+            let mut output = self.ctx.run_ui(raw, |ui| {
+                picked = language_select(ui, rect, current, false);
+            });
+            // There is no renderer here, so there is nothing to upload the textures to.
+            output.textures_delta.clear();
+            let open = egui::Popup::is_any_open(&self.ctx);
+            (picked, open)
+        }
+
+        fn click(&mut self, at: Pos2, current: Lang) -> Option<Lang> {
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            self.frame(vec![egui::Event::PointerMoved(at)], current);
+            self.frame(vec![button(true)], current);
+            let (picked, _) = self.frame(vec![button(false)], current);
+            picked
+        }
+
+        fn settle(&mut self, current: Lang) {
+            for _ in 0..3 {
+                self.frame(vec![], current);
+            }
         }
     }
-    picked
+
+    #[test]
+    fn clicking_the_pill_opens_the_list_and_a_row_picks_a_language() {
+        let mut h = Harness::new();
+        h.settle(Lang::English);
+        assert!(!egui::Popup::is_any_open(&h.ctx), "closed at first");
+
+        h.click(h.rect.center(), Lang::English);
+        h.settle(Lang::English);
+        assert!(egui::Popup::is_any_open(&h.ctx), "the list opens on click");
+
+        // Rows sit under the pill, right-aligned with it: the second row is "Русский".
+        let list_left = h.rect.right() - LANG_LIST_WIDTH;
+        let second_row = pos2(
+            list_left + LANG_LIST_WIDTH / 2.0,
+            h.rect.bottom() + 6.0 + 6.0 + LANG_ROW_HEIGHT + 2.0 + LANG_ROW_HEIGHT / 2.0,
+        );
+        let picked = h.click(second_row, Lang::English);
+        assert_eq!(picked, Some(Lang::Russian));
+        h.settle(Lang::Russian);
+        assert!(
+            !egui::Popup::is_any_open(&h.ctx),
+            "the list closes after picking"
+        );
+    }
+
+    #[test]
+    fn picking_the_current_language_changes_nothing() {
+        let mut h = Harness::new();
+        h.settle(Lang::English);
+        h.click(h.rect.center(), Lang::English);
+        h.settle(Lang::English);
+        let list_left = h.rect.right() - LANG_LIST_WIDTH;
+        let first_row = pos2(
+            list_left + LANG_LIST_WIDTH / 2.0,
+            h.rect.bottom() + 6.0 + 6.0 + LANG_ROW_HEIGHT / 2.0,
+        );
+        assert_eq!(h.click(first_row, Lang::English), None);
+    }
+
+    #[test]
+    fn history_labels_exist_in_both_languages() {
+        let entry = HistoryEntry {
+            number: "100".into(),
+            direction: Direction::Incoming,
+            outcome: Outcome::Missed,
+            started_at: 0,
+            duration_secs: 0,
+        };
+        assert_eq!(history_kind(&entry, Lang::English).1, "Missed");
+        assert_eq!(history_kind(&entry, Lang::Russian).1, "Пропущенный");
+        assert_eq!(format_duration(65, Lang::English), "1 min 05 s");
+        assert_eq!(format_duration(65, Lang::Russian), "1 мин 05 с");
+        assert_eq!(peer_label(UNKNOWN_PEER, Lang::English), "Unknown number");
+    }
 }

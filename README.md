@@ -27,7 +27,7 @@ Sign in to your PBX, dial a number, answer calls — on macOS, Windows and Linux
 - **Recent calls** — incoming, outgoing and missed, one click to call back.
 - **In-call controls** — mute, keypad tones (DTMF) for voice menus, hang up.
 - **Ringtone** that plays on every platform, with nothing extra to install.
-- **Two interface languages:** **English** (the default) and **Russian**. Switch at any time from the sign-in screen or from the top bar; the choice is remembered.
+- **Two interface languages:** **English** (the default) and **Russian**. Pick it from a drop-down list on the sign-in screen or in the top bar at any time; the choice is remembered.
 - **Single small binary.** No runtime, no installer required.
 
 ## 📦 Download
@@ -89,7 +89,7 @@ No keyring service? The phone still works; it just asks for the password each ti
 
 ### First launch
 
-1. Pick your language in the top-right corner if you want something other than English.
+1. Open the language drop-down in the top-right corner if you want something other than English.
 2. Enter the **station address** (your PBX, for example `192.168.1.10:5060`; the port defaults to `5060`), your **extension number** and your **password** — your administrator or provider gives you these.
 3. Press **Sign in**. When the dot in the top-left turns green and says **Online**, you are registered.
 4. Type or tap a number and press **Call**.
