@@ -14,6 +14,7 @@ mod rtp;
 mod sdp;
 mod store;
 mod ui;
+mod window;
 
 fn main() -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
@@ -22,8 +23,12 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("RustSIPPhone")
             .with_icon(icon)
-            .with_inner_size([400.0, 720.0])
-            .with_min_inner_size([360.0, 640.0]),
+            // A fixed-size window: it cannot be resized or maximized.
+            .with_inner_size(window::WINDOW_SIZE)
+            .with_min_inner_size(window::WINDOW_SIZE)
+            .with_max_inner_size(window::WINDOW_SIZE)
+            .with_resizable(false)
+            .with_maximize_button(false),
         ..Default::default()
     };
     eframe::run_native(

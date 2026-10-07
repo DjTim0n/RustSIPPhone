@@ -3,6 +3,7 @@
 use crate::i18n::Lang;
 use crate::model::*;
 use crate::store::{self, Stored};
+use crate::window;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke,
     TextEdit, Ui, UiBuilder, Vec2, pos2, vec2,
@@ -59,6 +60,8 @@ pub struct PhoneApp {
     muted: bool,
     keypad_open: bool,
     toast: Option<(Notice, Instant)>,
+    /// The user chose to quit, so the next close request really closes the window.
+    quitting: bool,
 }
 
 impl PhoneApp {
@@ -95,6 +98,7 @@ impl PhoneApp {
             muted: false,
             keypad_open: false,
             toast: None,
+            quitting: false,
         };
         app.try_auto_login();
         app
@@ -163,7 +167,7 @@ impl PhoneApp {
         self.send(Command::Dial(number.to_string()));
     }
 
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Reg(state) => {
@@ -179,6 +183,19 @@ impl PhoneApp {
                     self.reg = state;
                 }
                 Event::Call(view) => {
+                    // A call that starts ringing must surface even if the window is minimized or
+                    // closed to the background; once it stops ringing the window goes back to normal.
+                    let was_ringing = matches!(&self.call, Some(c) if c.phase == Phase::Incoming);
+                    let is_ringing = matches!(&view, Some(c) if c.phase == Phase::Incoming);
+                    if is_ringing && !was_ringing {
+                        for command in window::incoming_call_commands() {
+                            ctx.send_viewport_cmd(command);
+                        }
+                    } else if was_ringing && !is_ringing {
+                        for command in window::ring_finished_commands() {
+                            ctx.send_viewport_cmd(command);
+                        }
+                    }
                     if view.is_none() || self.call.is_none() {
                         self.muted = false;
                         self.keypad_open = false;
@@ -205,6 +222,31 @@ impl PhoneApp {
         self.stored.language
     }
 
+    /// A small "Quit app" link at the bottom. Closing the window only minimizes it (the phone
+    /// must keep running to ring), so this is how the user really quits on every platform.
+    fn quit_footer(&mut self, ui: &mut Ui) {
+        let l = self.lang();
+        let area = ui.max_rect();
+        let rect = Rect::from_center_size(
+            pos2(area.center().x, area.bottom() - 14.0),
+            vec2(200.0, 28.0),
+        );
+        let response = ui
+            .interact(rect, ui.id().with("quit_app"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            l.t("Quit app", "Закрыть приложение"),
+            FontId::proportional(13.0),
+            if response.hovered() { TEXT } else { MUTED },
+        );
+        if response.clicked() {
+            self.quitting = true;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     fn set_language(&mut self, lang: Lang) {
         if self.stored.language != lang {
             self.stored.language = lang;
@@ -214,8 +256,19 @@ impl PhoneApp {
 }
 
 impl eframe::App for PhoneApp {
+    /// Runs before every frame, and also while the window is minimized or hidden, when no frame is
+    /// drawn at all. That is why events from the phone core are handled here and not in `ui`:
+    /// an incoming call has to bring the window back even when nothing is on screen.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_events(ctx);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            for command in window::close_request_commands(self.quitting) {
+                ctx.send_viewport_cmd(command);
+            }
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        self.drain_events();
         let ctx = ui.ctx().clone();
 
         // During a call, digits typed on the keyboard go to the other side as tones.
@@ -366,6 +419,7 @@ impl PhoneApp {
         {
             self.submit_login();
         }
+        self.quit_footer(ui);
     }
 }
 
@@ -403,6 +457,7 @@ impl PhoneApp {
             Tab::Dial => self.dial_tab(ui),
             Tab::Recent => self.recent_tab(ui),
         }
+        self.quit_footer(ui);
     }
 
     fn header(&mut self, ui: &mut Ui) {
@@ -616,6 +671,8 @@ impl PhoneApp {
         let mut chosen: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            // Leave room for the "Quit app" link at the bottom.
+            .max_height((ui.available_height() - 44.0).max(100.0))
             .show(ui, |ui| {
                 for (i, entry) in self.stored.history.iter().enumerate() {
                     let rect = ui.allocate_space(vec2(ui.available_width(), 58.0)).1;

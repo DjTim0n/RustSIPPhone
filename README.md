@@ -27,6 +27,7 @@ Sign in to your PBX, dial a number, answer calls — on macOS, Windows and Linux
 - **Recent calls** — incoming, outgoing and missed, one click to call back.
 - **In-call controls** — mute, keypad tones (DTMF) for voice menus, hang up.
 - **Ringtone** that plays on every platform, with nothing extra to install.
+- **Runs in the background.** Closing the window minimizes it to the Dock or taskbar and the phone stays registered, so it can still ring. An incoming call restores the window, raises it above other windows, gives it focus and bounces the Dock icon / flashes the taskbar button.
 - **Two interface languages:** **English** (the default) and **Russian**. Pick it from a drop-down list on the sign-in screen or in the top bar at any time; the choice is remembered.
 - **Single small binary.** No runtime, no installer required.
 
@@ -93,7 +94,8 @@ No keyring service? The phone still works; it just asks for the password each ti
 2. Enter the **station address** (your PBX, for example `192.168.1.10:5060`; the port defaults to `5060`), your **extension number** and your **password** — your administrator or provider gives you these.
 3. Press **Sign in**. When the dot in the top-left turns green and says **Online**, you are registered.
 4. Type or tap a number and press **Call**.
-5. Incoming calls ring and open an **Answer / Decline** screen.
+5. Incoming calls ring and open an **Answer / Decline** screen, even if the window was closed or minimized.
+6. To really quit, press **Quit app** at the bottom of the window (or use **⌘Q** on macOS). Closing the window with the red button / **×** only sends it to the background.
 
 ## ✅ Verify your download
 
@@ -209,6 +211,7 @@ Your account, call history and language choice live in:
 ## 📝 Notes and limitations
 
 - **One account, one call at a time.**
+- **Fixed-size window:** it cannot be resized or maximized.
 - **Transport:** SIP over UDP, IPv4. No TCP/TLS yet.
 - **Audio:** G.711 (PCMU/PCMA) only. Calls are **not encrypted** (no SRTP); use a trusted network or a VPN.
 - **Not supported yet:** hold, transfer, video.
