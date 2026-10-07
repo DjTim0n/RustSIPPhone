@@ -2,6 +2,7 @@
 
 use crate::i18n::Lang;
 use crate::model::{Account, HistoryEntry};
+use crate::settings::{AudioSettings, ConnectionSettings};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -19,14 +20,21 @@ pub struct Stored {
     /// Interface language. Missing in older files, which then default to English.
     #[serde(default)]
     pub language: Lang,
+    /// Connection options of the account (transport, domain, proxy and so on).
+    #[serde(default)]
+    pub connection: ConnectionSettings,
+    #[serde(default)]
+    pub audio: AudioSettings,
 }
 
+/// Where the settings file lives. `RUSTSIPPHONE_CONFIG_DIR` overrides the system's location, which
+/// makes a portable setup possible and keeps the tests away from the real settings.
 fn path() -> Option<PathBuf> {
-    Some(
-        dirs::config_dir()?
-            .join("RustSIPPhone")
-            .join("settings.json"),
-    )
+    let dir = match std::env::var_os("RUSTSIPPHONE_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::config_dir()?.join("RustSIPPhone"),
+    };
+    Some(dir.join("settings.json"))
 }
 
 pub fn load() -> Stored {

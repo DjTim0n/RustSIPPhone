@@ -5,6 +5,7 @@ use crate::media::{self, MediaControl};
 use crate::model::*;
 use crate::ringtone::Ringtone;
 use crate::sdp;
+use crate::settings::AudioSettings;
 use rsipstack::dialog::authenticate::Credential;
 use rsipstack::dialog::dialog::DialogState;
 use rsipstack::dialog::dialog_layer::DialogLayer;
@@ -72,10 +73,42 @@ pub struct CallContext {
     pub dialog_layer: Arc<DialogLayer>,
     pub account: Arc<Account>,
     pub local_ip: IpAddr,
-    /// Address of the SIP server; media from it is trusted.
-    pub server_ip: IpAddr,
+    /// Addresses of the station (and of the outbound proxy, if any); media and calls from them
+    /// are trusted.
+    pub server_ips: Arc<Vec<IpAddr>>,
+    /// What registration learned about how the station sees us.
+    pub link: SharedLink,
+    pub audio: Arc<Mutex<AudioSettings>>,
     pub events: Events,
     pub slot: Arc<CallSlot>,
+}
+
+/// What registration learned that calls need as well.
+#[derive(Clone, Debug)]
+pub struct LinkInfo {
+    /// Our Contact address as the station sees it (public address, transport).
+    pub contact: rsipstack::sip::Uri,
+    /// The public IP to advertise for media, if one was discovered and may be used.
+    pub public_ip: Option<IpAddr>,
+}
+
+pub type SharedLink = Arc<Mutex<Option<LinkInfo>>>;
+
+impl CallContext {
+    fn link(&self) -> Option<LinkInfo> {
+        self.link.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The IP address put into the SDP: the public one when the station reported it.
+    fn media_ip(&self) -> IpAddr {
+        self.link()
+            .and_then(|link| link.public_ip)
+            .unwrap_or(self.local_ip)
+    }
+
+    fn audio_settings(&self) -> AudioSettings {
+        self.audio.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 struct Finished {
@@ -152,7 +185,7 @@ async fn outgoing(
     let account = &ctx.account;
 
     // Open the devices before the INVITE: if microphone access is missing, better to learn it right away.
-    let audio = match AudioIo::start() {
+    let audio = match AudioIo::start(&ctx.audio_settings()) {
         Ok(audio) => audio,
         Err(err) => return Finished::failed(Notice::AudioUnavailable(err)),
     };
@@ -161,20 +194,26 @@ async fn outgoing(
         Err(err) => return Finished::failed(Notice::SoundSetupFailed(err.to_string())),
     };
     let rtp_port = rtp_socket.local_addr().map(|a| a.port()).unwrap_or(0);
-    let offer = sdp::build_offer(ctx.local_ip, rtp_port, now_unix() as u64);
+    let offer = sdp::build_offer(ctx.media_ip(), rtp_port, now_unix() as u64);
 
     let parse_uri = |text: String| {
         text.parse::<rsipstack::sip::Uri>()
             .map_err(|e| e.to_string())
     };
     let build_invite = || -> Result<InviteOption, String> {
-        Ok(InviteOption {
-            caller: parse_uri(format!("sip:{}@{}", account.extension, account.server))?,
-            callee: parse_uri(format!("sip:{}@{}", number, account.server))?,
-            contact: ctx
+        let contact = match ctx.link() {
+            Some(link) => link.contact,
+            None => ctx
                 .dialog_layer
                 .build_local_contact(Some(account.extension.clone()), None)
                 .map_err(|e| e.to_string())?,
+        };
+        let display_name = account.connection.display_name.trim();
+        Ok(InviteOption {
+            caller_display_name: (!display_name.is_empty()).then(|| display_name.to_string()),
+            caller: parse_uri(account.own_uri())?,
+            callee: parse_uri(account.callee_uri(number))?,
+            contact,
             content_type: Some("application/sdp".to_string()),
             offer: Some(offer.clone().into_bytes()),
             credential: Some(credential(account)),
@@ -313,7 +352,7 @@ async fn incoming(
         &tx,
         state_tx,
         Some(credential(&ctx.account)),
-        None,
+        ctx.link().map(|link| link.contact),
     ) {
         Ok(dialog) => dialog,
         Err(_) => {
@@ -330,7 +369,8 @@ async fn incoming(
 
     publish(ctx, peer, Phase::Incoming);
     // No speaker, or the tone failed to start: the call is still visible on screen.
-    let ringtone = tokio::task::spawn_blocking(Ringtone::start)
+    let output_device = ctx.audio_settings().output_device;
+    let ringtone = tokio::task::spawn_blocking(move || Ringtone::start(output_device.as_deref()))
         .await
         .ok()
         .and_then(Result::ok);
@@ -373,7 +413,7 @@ async fn incoming(
         }
     }
 
-    let audio = match AudioIo::start() {
+    let audio = match AudioIo::start(&ctx.audio_settings()) {
         Ok(audio) => audio,
         Err(err) => {
             let _ = dialog.reject(Some(StatusCode::ServerInternalError), None);
@@ -391,7 +431,7 @@ async fn incoming(
     };
     let rtp_port = rtp_socket.local_addr().map(|a| a.port()).unwrap_or(0);
     let answer = sdp::build_sdp(
-        ctx.local_ip,
+        ctx.media_ip(),
         rtp_port,
         now_unix() as u64,
         &[remote.codec],
@@ -460,7 +500,7 @@ async fn talk(
             muted: muted.clone(),
             dtmf: dtmf_rx,
         },
-        ctx.server_ip,
+        ctx.server_ips.to_vec(),
         stop.clone(),
     ));
 

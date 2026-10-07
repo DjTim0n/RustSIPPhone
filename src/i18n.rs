@@ -186,6 +186,27 @@ impl Notice {
                     "Собеседника не было слышно: звук от него не приходил. Возможно, мешают настройки сети",
                 )
                 .into(),
+            Notice::ConnectionFailed(detail) => format!(
+                "{}: {detail}",
+                lang.t(
+                    "Couldn't connect to the station",
+                    "Не удалось подключиться к станции"
+                )
+            ),
+            Notice::TlsProblem(detail) => format!(
+                "{}: {detail}",
+                lang.t(
+                    "The secure connection failed, check the station's certificate",
+                    "Не удалось установить защищённое соединение, проверьте сертификат станции"
+                )
+            ),
+            Notice::CertificateFileUnreadable(path) => format!(
+                "{}: {path}",
+                lang.t(
+                    "Couldn't read the certificate file",
+                    "Не удалось прочитать файл сертификата"
+                )
+            ),
             Notice::PasswordNotSaved => lang
                 .t(
                     "Password not saved: this system has no password store. You'll need to enter it next time",
@@ -234,6 +255,9 @@ mod tests {
             Notice::PeerEndedCall,
             Notice::NoAudioReceived,
             Notice::PasswordNotSaved,
+            Notice::ConnectionFailed("refused".into()),
+            Notice::TlsProblem("unknown issuer".into()),
+            Notice::CertificateFileUnreadable("/tmp/ca.pem".into()),
         ];
         for notice in notices {
             let en = notice.text(Lang::English);

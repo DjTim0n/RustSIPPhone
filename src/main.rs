@@ -12,6 +12,7 @@ mod net;
 mod ringtone;
 mod rtp;
 mod sdp;
+mod settings;
 mod store;
 mod tray;
 mod ui;

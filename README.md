@@ -41,6 +41,10 @@ Sign in to your PBX, dial a number, answer calls — on macOS, Windows and Linux
 - **Outgoing and incoming calls** over SIP, with digest authentication.
 - **Sign in inside the app** — no config files, no command line. Your password is kept in the system keychain.
 - **Dialer** with an on-screen keypad and keyboard input.
+- **Every common way to connect:** UDP, TCP, TLS (encrypted), WebSocket (WS) and secure WebSocket (WSS), picked in **Settings → Network**.
+- **Station by name or by IP.** Type a host name and the phone finds the station through its DNS records (SRV, RFC 3263), or enter an IP address and a port yourself.
+- **Settings for real setups:** SIP domain, outbound proxy, registration time, display name, an extra certificate for private TLS, and an option to advertise your public address behind a router (NAT).
+- **Choose your microphone and speaker** in **Settings → Audio**; the ringtone follows the speaker.
 - **Recent calls** — incoming, outgoing and missed, one click to call back.
 - **In-call controls** — mute, keypad tones (DTMF) for voice menus, hang up.
 - **Ringtone** that plays on every platform, with nothing extra to install.
@@ -237,7 +241,7 @@ Your account, call history and language choice live in:
 
 - **One account, one call at a time.**
 - **Fixed-size window:** it cannot be resized or maximized.
-- **Transport:** SIP over UDP, IPv4. No TCP/TLS yet.
+- **Transport:** UDP, TCP, TLS, WS and WSS. Audio is IPv4-only, so the phone prefers IPv4 addresses of a station. TLS trusts the operating system's certificates plus an optional extra file; a self-signed station certificate must be added there. WSS trusts the system's certificates only.
 - **Audio:** G.711 (PCMU/PCMA) only. Calls are **not encrypted** (no SRTP); use a trusted network or a VPN.
 - **Not supported yet:** hold, transfer, video.
 - **NAT:** works when the PBX is on your network or reachable publicly. If you are behind NAT and the other side hears nothing, check that your router does not block UDP media from the PBX.

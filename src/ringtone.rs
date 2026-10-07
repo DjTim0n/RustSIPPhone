@@ -1,7 +1,7 @@
 //! Incoming-call ringtone. It is synthesized on the fly and played through cpal,
 //! so it sounds the same on macOS, Windows and Linux and needs no sound files.
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
 pub struct Ringtone {
@@ -10,12 +10,14 @@ pub struct Ringtone {
 }
 
 impl Ringtone {
-    /// Starts playing the tone until the object is dropped.
-    pub fn start() -> Result<Ringtone, String> {
+    /// Starts playing the tone on the named speaker (the default if `None`) until the object is
+    /// dropped.
+    pub fn start(output_device: Option<&str>) -> Result<Ringtone, String> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let output_device = output_device.map(str::to_string);
         // The cpal stream is not `Send` on some platforms, so it lives on its own thread.
-        let thread = std::thread::spawn(move || match build_stream() {
+        let thread = std::thread::spawn(move || match build_stream(output_device.as_deref()) {
             Ok(stream) => {
                 let _ = ready_tx.send(Ok(()));
                 let _ = stop_rx.recv();
@@ -48,9 +50,8 @@ impl Drop for Ringtone {
     }
 }
 
-fn build_stream() -> Result<cpal::Stream, String> {
-    let device = cpal::default_host()
-        .default_output_device()
+fn build_stream(output_device: Option<&str>) -> Result<cpal::Stream, String> {
+    let device = crate::audio::pick_output(&cpal::default_host(), output_device)
         .ok_or("no speaker found")?;
     let supported = device
         .default_output_config()

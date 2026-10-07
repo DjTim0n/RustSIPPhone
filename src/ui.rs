@@ -1,9 +1,13 @@
 //! The phone's interface, built with egui.
 
+use crate::audio::AudioDevices;
 use crate::i18n::Lang;
 use crate::model::*;
 use crate::store::{self, Stored};
 use crate::tray::{Tray, TrayAction};
+use settings_screen::{SettingsDraft, SettingsTab};
+
+mod settings_screen;
 use crate::window;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke,
@@ -67,16 +71,24 @@ pub struct PhoneApp {
     in_background: bool,
     /// System tray icon (Windows). `None` where there is no tray, or if creating it failed.
     tray: Option<Tray>,
+    /// The settings being edited; `Some` while the settings screen is open.
+    settings: Option<SettingsDraft>,
+    devices: AudioDevices,
 }
 
 impl PhoneApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_style(&cc.egui_ctx);
+        Self::build(&cc.egui_ctx)
+    }
 
+    /// Creates the app and starts the phone core. Separate from `new` so tests can build one
+    /// without a window.
+    fn build(egui_ctx: &egui::Context) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("could not start the async runtime");
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
-        let repaint_ctx = cc.egui_ctx.clone();
+        let repaint_ctx = egui_ctx.clone();
         let events = Events::new(
             event_tx,
             std::sync::Arc::new(move || repaint_ctx.request_repaint()),
@@ -84,7 +96,7 @@ impl PhoneApp {
         let engine = runtime.spawn(crate::engine::run(command_rx, events));
 
         let stored = store::load();
-        let tray = Tray::new(&cc.egui_ctx, stored.language);
+        let tray = Tray::new(egui_ctx, stored.language);
         let mut app = PhoneApp {
             runtime,
             engine: Some(engine),
@@ -107,7 +119,10 @@ impl PhoneApp {
             quitting: false,
             in_background: false,
             tray,
+            settings: None,
+            devices: AudioDevices::default(),
         };
+        app.send(Command::SetAudio(app.stored.audio.clone()));
         app.try_auto_login();
         app
     }
@@ -122,6 +137,7 @@ impl PhoneApp {
                 server: self.stored.server.clone(),
                 extension: self.stored.extension.clone(),
                 password,
+                connection: self.stored.connection.clone(),
             };
             self.signed_in = true;
             self.reg = RegState::Connecting;
@@ -134,14 +150,13 @@ impl PhoneApp {
     }
 
     fn submit_login(&mut self) {
-        let mut server = self.form.server.trim().to_string();
-        if !server.contains(':') {
-            server.push_str(":5060");
-        }
+        // The address is used as typed. Without a port the stack looks up the station's SRV
+        // records and falls back to the transport's default port.
         let account = Account {
-            server,
+            server: self.form.server.trim().to_string(),
             extension: self.form.extension.trim().to_string(),
             password: self.form.password.clone(),
+            connection: self.stored.connection.clone(),
         };
         // No password store (for example Linux without gnome-keyring) is no reason to refuse:
         // sign in, but honestly warn that the password will have to be typed again.
@@ -338,6 +353,25 @@ impl eframe::App for PhoneApp {
             }
         }
 
+        self.show(ui);
+    }
+
+    fn on_exit(&mut self) {
+        // Ask the core to hang up and unregister, and wait for it briefly.
+        self.send(Command::Shutdown);
+        if let Some(engine) = self.engine.take() {
+            // `timeout` creates a timer, which needs the runtime to be running already, so it
+            // must be built inside the future and not as the argument of `block_on`.
+            let _ = self
+                .runtime
+                .block_on(async { tokio::time::timeout(Duration::from_secs(8), engine).await });
+        }
+    }
+}
+
+impl PhoneApp {
+    /// Draws the current screen. Kept apart from `ui` so tests can draw the app without a window.
+    fn show(&mut self, ui: &mut Ui) {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -352,27 +386,17 @@ impl eframe::App for PhoneApp {
                     vec2(width, full.height()),
                 );
                 ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
-                    if !self.signed_in {
-                        self.login_screen(ui);
-                    } else if self.call.is_some() {
+                    if self.call.is_some() {
                         self.call_screen(ui);
+                    } else if self.settings.is_some() {
+                        self.settings_screen(ui);
+                    } else if !self.signed_in {
+                        self.login_screen(ui);
                     } else {
                         self.phone_screen(ui);
                     }
                 });
             });
-    }
-
-    fn on_exit(&mut self) {
-        // Ask the core to hang up and unregister, and wait for it briefly.
-        self.send(Command::Shutdown);
-        if let Some(engine) = self.engine.take() {
-            // `timeout` creates a timer, which needs the runtime to be running already, so it
-            // must be built inside the future and not as the argument of `block_on`.
-            let _ = self
-                .runtime
-                .block_on(async { tokio::time::timeout(Duration::from_secs(8), engine).await });
-        }
     }
 }
 
@@ -462,6 +486,25 @@ impl PhoneApp {
         {
             self.submit_login();
         }
+        ui.add_space(10.0);
+        let link = ui.allocate_space(vec2(ui.available_width(), 26.0)).1;
+        let link_response = ui
+            .interact(link, ui.id().with("login_settings"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        ui.painter().text(
+            link.center(),
+            Align2::CENTER_CENTER,
+            l.t("Connection settings", "Настройки подключения"),
+            FontId::proportional(13.5),
+            if link_response.hovered() {
+                TEXT
+            } else {
+                ACCENT
+            },
+        );
+        if link_response.clicked() {
+            self.open_settings(SettingsTab::Network);
+        }
         self.quit_footer(ui);
     }
 }
@@ -536,35 +579,42 @@ impl PhoneApp {
             FontId::proportional(12.5),
             MUTED,
         );
-        let exit_rect =
-            Rect::from_center_size(pos2(rect.right() - 36.0, rect.center().y), vec2(72.0, 32.0));
-        let response = ui.interact(exit_rect, ui.id().with("sign_out"), Sense::click());
-        let fill = if response.hovered() {
-            SURFACE_HI
-        } else {
-            SURFACE
-        };
-        ui.painter()
-            .rect_filled(exit_rect, CornerRadius::same(16), fill);
-        ui.painter().text(
-            exit_rect.center(),
-            Align2::CENTER_CENTER,
-            l.t("Sign out", "Выйти"),
-            FontId::proportional(13.5),
-            MUTED,
+        // The settings button: a round gear at the right edge.
+        let gear_rect =
+            Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(32.0, 32.0));
+        let gear = ui
+            .interact(gear_rect, ui.id().with("open_settings"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(l.t("Settings", "Настройки"));
+        let fill = if gear.hovered() { SURFACE_HI } else { SURFACE };
+        ui.painter().circle_filled(gear_rect.center(), 16.0, fill);
+        settings_screen::draw_gear(
+            ui,
+            gear_rect.center(),
+            8.5,
+            if gear.hovered() { TEXT } else { MUTED },
         );
-        if response.clicked() {
-            self.sign_out();
+        if gear.clicked() {
+            self.open_settings(SettingsTab::Account);
         }
         let switch_rect = Rect::from_center_size(
             pos2(
-                exit_rect.left() - 10.0 - LANG_SELECT_WIDTH / 2.0,
+                gear_rect.left() - 10.0 - LANG_SELECT_WIDTH / 2.0,
                 rect.center().y,
             ),
             vec2(LANG_SELECT_WIDTH, 32.0),
         );
         if let Some(chosen) = language_select(ui, switch_rect, l) {
             self.set_language(chosen);
+        }
+        // The full explanation of a connection problem, when there is one.
+        if let RegState::Failed { notice, .. } = &self.reg {
+            let status_rect = Rect::from_min_size(
+                pos2(rect.left() + 20.0, rect.center().y),
+                vec2(switch_rect.left() - rect.left() - 28.0, 18.0),
+            );
+            ui.interact(status_rect, ui.id().with("status_detail"), Sense::hover())
+                .on_hover_text(notice.text(l));
         }
     }
 

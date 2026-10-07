@@ -3,6 +3,7 @@
 //! cpal streams are not `Send` on some platforms, so they live on their own thread
 //! and talk to the async world through a channel (microphone) and a shared queue (speaker).
 
+use crate::settings::AudioSettings;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use std::collections::VecDeque;
@@ -27,15 +28,17 @@ pub struct AudioIo {
 }
 
 impl AudioIo {
-    pub fn start() -> Result<AudioIo, String> {
+    /// Opens the microphone and speaker named in `settings` (or the system defaults).
+    pub fn start(settings: &AudioSettings) -> Result<AudioIo, String> {
         let (mic_tx, mic_rx) = mpsc::channel::<Vec<i16>>(64);
         let speaker: SpeakerQueue = Arc::new(Mutex::new(Playback::default()));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
         let speaker_for_thread = speaker.clone();
+        let settings = settings.clone();
         let thread = std::thread::spawn(move || {
-            match build_streams(mic_tx, speaker_for_thread) {
+            match build_streams(mic_tx, speaker_for_thread, &settings) {
                 Ok(streams) => {
                     let _ = ready_tx.send(Ok(()));
                     // Wait for the stop signal (or the channel closing); the streams are dropped afterwards.
@@ -111,12 +114,78 @@ struct Streams {
     _output: cpal::Stream,
 }
 
-fn build_streams(mic_tx: mpsc::Sender<Vec<i16>>, speaker: SpeakerQueue) -> Result<Streams, String> {
+/// The name an audio device goes by in the settings.
+fn device_name(device: &cpal::Device) -> Option<String> {
+    device
+        .description()
+        .ok()
+        .map(|description| description.name().to_string())
+}
+
+/// The input device called `name`, or the system default when there is no such device (it may be
+/// unplugged) or no name was chosen.
+fn pick_input(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
+    if let (Some(name), Ok(devices)) = (name, host.input_devices()) {
+        for device in devices {
+            if device_name(&device).as_deref() == Some(name) {
+                return Some(device);
+            }
+        }
+    }
+    host.default_input_device()
+}
+
+/// Same as [`pick_input`] for speakers.
+pub fn pick_output(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
+    if let (Some(name), Ok(devices)) = (name, host.output_devices()) {
+        for device in devices {
+            if device_name(&device).as_deref() == Some(name) {
+                return Some(device);
+            }
+        }
+    }
+    host.default_output_device()
+}
+
+/// The audio devices that can be chosen in the settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioDevices {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub default_input: Option<String>,
+    pub default_output: Option<String>,
+}
+
+pub fn list_devices() -> AudioDevices {
     let host = cpal::default_host();
-    let input_device = host
-        .default_input_device()
+    let names = |devices: Option<Vec<cpal::Device>>| -> Vec<String> {
+        let mut names: Vec<String> = devices
+            .unwrap_or_default()
+            .iter()
+            .filter_map(device_name)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    AudioDevices {
+        inputs: names(host.input_devices().ok().map(|d| d.collect())),
+        outputs: names(host.output_devices().ok().map(|d| d.collect())),
+        default_input: host.default_input_device().as_ref().and_then(device_name),
+        default_output: host.default_output_device().as_ref().and_then(device_name),
+    }
+}
+
+fn build_streams(
+    mic_tx: mpsc::Sender<Vec<i16>>,
+    speaker: SpeakerQueue,
+    settings: &AudioSettings,
+) -> Result<Streams, String> {
+    let host = cpal::default_host();
+    let input_device = pick_input(&host, settings.input_device.as_deref())
         .ok_or("no microphone found (check microphone access in system settings)")?;
-    let output_device = host.default_output_device().ok_or("no speaker found")?;
+    let output_device =
+        pick_output(&host, settings.output_device.as_deref()).ok_or("no speaker found")?;
 
     let input = build_input(&input_device, mic_tx)?;
     let output = build_output(&output_device, speaker)?;

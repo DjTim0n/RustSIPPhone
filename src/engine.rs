@@ -1,25 +1,33 @@
 //! Phone core: keeps the SIP registration, takes commands from the interface and starts calls.
 
-use crate::call::{self, CallContext, CallCtl, CallSlot};
+use crate::call::{self, CallContext, CallCtl, CallSlot, LinkInfo, SharedLink};
 use crate::model::*;
 use crate::net;
+use crate::settings::{AudioSettings, TransportKind, split_host_port};
 use rsipstack::dialog::authenticate::Credential;
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::registration::Registration;
-use rsipstack::sip::{Method, StatusCode};
+use rsipstack::sip::{Auth, Host, HostWithPort, Method, Param, Scheme, StatusCode, Uri};
 use rsipstack::transaction::Endpoint;
-use std::sync::Arc;
+use rsipstack::transport::SipAddr;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// How often the registration is refreshed (its lifetime is 60 s).
-const REFRESH_EVERY: Duration = Duration::from_secs(40);
 const RETRY_AFTER: Duration = Duration::from_secs(15);
+
+/// When to renew a registration that lives `expiry` seconds: well before it runs out, and often
+/// enough to keep a NAT mapping open.
+fn refresh_interval(expiry: u32) -> Duration {
+    Duration::from_secs((u64::from(expiry) * 2 / 3).clamp(10, 3000))
+}
 
 pub async fn run(mut commands: UnboundedReceiver<Command>, events: Events) {
     let slot = Arc::new(CallSlot::default());
+    let audio = Arc::new(Mutex::new(AudioSettings::default()));
     let mut session: Option<Session> = None;
 
     while let Some(command) = commands.recv().await {
@@ -29,7 +37,7 @@ pub async fn run(mut commands: UnboundedReceiver<Command>, events: Events) {
                     old.stop().await;
                 }
                 events.send(Event::Reg(RegState::Connecting));
-                match Session::start(account, events.clone(), slot.clone()).await {
+                match Session::start(account, events.clone(), slot.clone(), audio.clone()).await {
                     Ok(new) => session = Some(new),
                     Err(notice) => events.send(Event::Reg(RegState::Failed {
                         notice,
@@ -52,6 +60,9 @@ pub async fn run(mut commands: UnboundedReceiver<Command>, events: Events) {
                 }
                 None => events.send(Event::Toast(Notice::SignInFirst)),
             },
+            Command::SetAudio(settings) => {
+                *audio.lock().unwrap_or_else(|e| e.into_inner()) = settings
+            }
             Command::Answer => slot.send(CallCtl::Answer),
             Command::Reject => slot.send(CallCtl::Reject),
             Command::Hangup => slot.send(CallCtl::Hangup),
@@ -87,23 +98,40 @@ impl Session {
         account: Account,
         events: Events,
         slot: Arc<CallSlot>,
+        audio: Arc<Mutex<AudioSettings>>,
     ) -> Result<Session, Notice> {
-        let server_addr = net::resolve(&account.server)
+        let transport = account.connection.transport;
+        let (host, port) = account.server_host_port();
+        let mut server_ips: Vec<IpAddr> = Vec::new();
+        let targets = net::resolve_targets(&host, port, transport)
             .await
             .map_err(|_| Notice::ServerNotFound)?;
-        let local_ip = net::local_ip_towards(server_addr).map_err(|_| Notice::NoNetwork)?;
+        server_ips.extend(targets.iter().map(|a| a.ip()));
+        let mut first = targets[0];
+        let proxy = account.connection.outbound_proxy.trim();
+        if !proxy.is_empty() {
+            let (proxy_host, proxy_port) = split_host_port(proxy);
+            let proxy_targets = net::resolve_targets(&proxy_host, proxy_port, transport)
+                .await
+                .map_err(|_| Notice::ServerNotFound)?;
+            server_ips.extend(proxy_targets.iter().map(|a| a.ip()));
+            first = proxy_targets[0];
+        }
+        server_ips.dedup();
+        let local_ip = net::local_ip_towards(first).map_err(|_| Notice::NoNetwork)?;
         let account = Arc::new(account);
 
         let cancel = CancellationToken::new();
-        let endpoint = create_endpoint(local_ip, cancel.clone())
-            .await
-            .map_err(|e| Notice::PhoneStartFailed(e.to_string()))?;
+        let endpoint = create_endpoint(local_ip, cancel.clone(), &account).await?;
         let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
+        let link: SharedLink = Arc::new(Mutex::new(None));
         let ctx = CallContext {
             dialog_layer,
             account: account.clone(),
             local_ip,
-            server_ip: server_addr.ip(),
+            server_ips: Arc::new(server_ips),
+            link: link.clone(),
+            audio,
             events: events.clone(),
             slot,
         };
@@ -125,6 +153,7 @@ impl Session {
             account,
             events,
             cancel.clone(),
+            link,
         ));
 
         Ok(Session {
@@ -151,26 +180,162 @@ impl Session {
     }
 }
 
+/// The address every request is sent to when that is not simply the host of its URI: the
+/// outbound proxy if one is set, the station when the SIP domain is a different name, and for
+/// every connection-oriented transport (TCP, TLS, WS, WSS), because the URI of a call does not say
+/// which transport to use.
+fn outbound_addr(account: &Account) -> Option<SipAddr> {
+    let connection = &account.connection;
+    let transport = connection.transport;
+    let proxy = connection.outbound_proxy.trim();
+    let (host, port) = account.server_host_port();
+    let domain = connection.domain.trim();
+    let domain_differs = !domain.is_empty() && !domain.eq_ignore_ascii_case(&host);
+    if proxy.is_empty() && !domain_differs && !transport.is_stream() {
+        return None;
+    }
+    let (host, port) = if proxy.is_empty() {
+        (host, port)
+    } else {
+        split_host_port(proxy)
+    };
+    Some(sip_addr(&host, port, transport))
+}
+
+/// A SIP address for `host`: a name stays a name (so SRV records are looked up when there is no
+/// port), an IP gets the transport's default port.
+fn sip_addr(host: &str, port: Option<u16>, transport: TransportKind) -> SipAddr {
+    let addr = match host.parse::<IpAddr>() {
+        Ok(ip) => HostWithPort {
+            host: Host::IpAddr(ip),
+            port: Some(port.unwrap_or(transport.default_port()).into()),
+        },
+        Err(_) => HostWithPort {
+            host: Host::Domain(host.into()),
+            port: port.map(Into::into),
+        },
+    };
+    SipAddr {
+        r#type: Some(transport.sip()),
+        addr,
+    }
+}
+
 async fn create_endpoint(
-    local_ip: std::net::IpAddr,
+    local_ip: IpAddr,
     cancel: CancellationToken,
-) -> rsipstack::Result<Endpoint> {
-    // Bind to a specific address so Via/Contact name the interface the station can see.
+    account: &Arc<Account>,
+) -> Result<Endpoint, Notice> {
+    let start_failed = |e: rsipstack::Error| Notice::PhoneStartFailed(e.to_string());
+    // A UDP socket is always bound: it carries UDP calls and gives every other transport a local
+    // address to build requests from. Bind to a specific address so Via/Contact name the
+    // interface the station can see.
     let local_address = std::net::SocketAddr::new(local_ip, 0);
-    let transport_layer = rsipstack::transport::TransportLayer::new(cancel.clone());
+    let mut transport_layer = rsipstack::transport::TransportLayer::new(cancel.clone());
     let udp = rsipstack::transport::udp::UdpConnection::create_connection(
         local_address,
         None,
         Some(cancel.clone()),
     )
-    .await?;
+    .await
+    .map_err(start_failed)?;
     transport_layer.add_transport(udp.into());
+    transport_layer.outbound = outbound_addr(account);
+
+    match account.connection.transport {
+        TransportKind::Tls => {
+            // Loading the system's certificates reads files, so keep it off the async threads.
+            let for_tls = account.clone();
+            let config = tokio::task::spawn_blocking(move || net::tls_config(&for_tls))
+                .await
+                .map_err(|e| Notice::PhoneStartFailed(e.to_string()))?
+                .map_err(Notice::CertificateFileUnreadable)?;
+            transport_layer.set_tls_config(config);
+        }
+        TransportKind::Ws | TransportKind::Wss => {
+            transport_layer.set_ws_path(account.connection.ws_path.clone());
+        }
+        TransportKind::Udp | TransportKind::Tcp => {}
+    }
+
     let mut builder = rsipstack::EndpointBuilder::new();
     builder.with_transport_layer(transport_layer);
     builder.with_cancel_token(cancel);
-    builder.with_user_agent("RustSIPPhone/0.1");
+    builder.with_user_agent("RustSIPPhone/1.0");
     builder.with_inspector(Box::new(SourceStamp));
     Ok(builder.build())
+}
+
+/// Our own address as the station will see it. For a connection-oriented transport this opens
+/// (and keeps) the connection, because only then is its local port known.
+async fn local_address(
+    endpoint: &rsipstack::transaction::endpoint::EndpointInnerRef,
+    target: &Uri,
+    transport: TransportKind,
+) -> rsipstack::Result<HostWithPort> {
+    if transport.is_stream() {
+        let target = SipAddr::try_from(target)?;
+        let (connection, _) = endpoint.transport_layer.lookup(&target, None).await?;
+        Ok(connection.get_addr().addr.clone())
+    } else {
+        endpoint
+            .transport_layer
+            .get_addrs()
+            .into_iter()
+            .next()
+            .map(|addr| addr.addr)
+            .ok_or_else(|| rsipstack::Error::Error("no local address".into()))
+    }
+}
+
+/// How an address looks in a Contact header: with the transport spelled out when it is not UDP.
+fn contact_uri(account: &Account, host: HostWithPort) -> Uri {
+    let transport = account.connection.transport;
+    Uri {
+        scheme: Some(Scheme::Sip),
+        auth: Some(Auth {
+            user: account.extension.clone(),
+            password: None,
+        }),
+        host_with_port: host,
+        params: if transport.is_stream() {
+            vec![Param::Transport(transport.sip())]
+        } else {
+            Vec::new()
+        },
+        headers: Vec::new(),
+    }
+}
+
+fn typed_contact(account: &Account, host: HostWithPort) -> rsipstack::sip::typed::Contact {
+    rsipstack::sip::typed::Contact {
+        display_name: None,
+        uri: contact_uri(account, host),
+        params: Vec::new(),
+    }
+}
+
+/// Which notice describes a connection error best.
+fn describe_error(error: &rsipstack::Error, transport: TransportKind) -> Notice {
+    let text = error.to_string();
+    let lower = text.to_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        Notice::RegistrationRetrying
+    } else if transport.is_secure()
+        && [
+            "certificate",
+            "tls",
+            "handshake",
+            "invalid dns name",
+            "unknown issuer",
+        ]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        Notice::TlsProblem(text)
+    } else {
+        Notice::ConnectionFailed(text)
+    }
 }
 
 async fn registration_loop(
@@ -178,16 +343,19 @@ async fn registration_loop(
     account: Arc<Account>,
     events: Events,
     cancel: CancellationToken,
+    link: SharedLink,
 ) {
-    let Ok(target) = format!("sip:{}", account.server).parse::<rsipstack::sip::Uri>() else {
+    let Ok(target) = account.register_uri().parse::<Uri>() else {
         events.send(Event::Reg(RegState::Failed {
             notice: Notice::ServerAddressInvalid,
             retry: false,
         }));
         return;
     };
+    let transport = account.connection.transport;
+    let expiry = account.connection.expiry();
     let mut registration = Registration::new(
-        endpoint,
+        endpoint.clone(),
         Some(Credential {
             username: account.extension.clone(),
             password: account.password.clone(),
@@ -196,16 +364,59 @@ async fn registration_loop(
     );
 
     let mut ever_online = false;
+    let mut local: Option<HostWithPort> = None;
     loop {
+        // Learn our local address first: the Contact header has to carry it (and, for the
+        // connection-oriented transports, the transport), and calls reuse it.
+        if local.is_none() {
+            match local_address(&endpoint, &target, transport).await {
+                Ok(address) => {
+                    registration.contact = Some(typed_contact(&account, address.clone()));
+                    local = Some(address);
+                }
+                Err(error) => {
+                    let notice = describe_error(&error, transport);
+                    // A certificate or configuration problem is not cured by waiting.
+                    let retry = ever_online || !matches!(notice, Notice::TlsProblem(_));
+                    events.send(Event::Reg(RegState::Failed { notice, retry }));
+                    if !retry {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(RETRY_AFTER) => {}
+                    }
+                    continue;
+                }
+            }
+        }
+
         let result = tokio::select! {
             _ = cancel.cancelled() => break,
-            result = registration.register(target.clone(), Some(60)) => result,
+            result = registration.register(target.clone(), Some(expiry)) => result,
         };
         let delay = match result {
             Ok(response) if response.status_code().code() == 200 => {
                 ever_online = true;
+                // Remember how the station sees us, for the Contact of calls and for the media
+                // address, then keep using it for the next renewal too.
+                let own = local.clone().expect("set above");
+                let public = if account.connection.use_public_address {
+                    registration.public_address.clone()
+                } else {
+                    None
+                };
+                let advertised = public.clone().unwrap_or(own);
+                registration.contact = Some(typed_contact(&account, advertised.clone()));
+                *link.lock().unwrap_or_else(|e| e.into_inner()) = Some(LinkInfo {
+                    contact: contact_uri(&account, advertised),
+                    public_ip: public.and_then(|address| match address.host {
+                        Host::IpAddr(ip) => Some(ip),
+                        Host::Domain(_) => None,
+                    }),
+                });
                 events.send(Event::Reg(RegState::Online));
-                REFRESH_EVERY
+                refresh_interval(expiry)
             }
             Ok(response) => {
                 let code = response.status_code().code();
@@ -221,9 +432,11 @@ async fn registration_loop(
                 }
                 RETRY_AFTER
             }
-            Err(_) => {
+            Err(error) => {
+                // The connection may have been lost: learn our address again next time.
+                local = None;
                 events.send(Event::Reg(RegState::Failed {
-                    notice: Notice::RegistrationRetrying,
+                    notice: describe_error(&error, transport),
                     retry: true,
                 }));
                 RETRY_AFTER
@@ -259,7 +472,9 @@ async fn incoming_loop(
                 // UDP source addresses can be forged, but a stranger should not be able to make
                 // the phone ring with an arbitrary caller name: only the server we registered
                 // with may send us calls.
-                if request_source_ip(&transaction.original) == Some(ctx.server_ip) {
+                if request_source_ip(&transaction.original)
+                    .is_some_and(|ip| ctx.server_ips.contains(&ip))
+                {
                     call::start_incoming(ctx.clone(), transaction);
                 } else {
                     let _ = transaction.reply(StatusCode::Forbidden).await;
@@ -352,9 +567,13 @@ mod tests {
     #[tokio::test]
     async fn forged_headers_do_not_change_the_verified_source() {
         let cancel = CancellationToken::new();
-        let endpoint = create_endpoint("127.0.0.1".parse().unwrap(), cancel.clone())
-            .await
-            .expect("endpoint");
+        let endpoint = create_endpoint(
+            "127.0.0.1".parse().unwrap(),
+            cancel.clone(),
+            &Arc::new(Account::default()),
+        )
+        .await
+        .expect("endpoint");
         let target = endpoint.get_addrs()[0].addr.to_string();
         let mut incoming = endpoint.incoming_transactions().expect("incoming");
         let inner = endpoint.inner.clone();
@@ -392,5 +611,302 @@ mod tests {
                    From: <sip:1@x>;tag=1\r\nTo: <sip:300@x>\r\nCall-ID: a\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let request = rsipstack::sip::Request::try_from(raw).expect("valid request");
         assert_eq!(request_source_ip(&request), None);
+    }
+}
+
+/// End-to-end tests: the real phone core registers on a small station built from the same SIP
+/// stack, over every transport.
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use crate::settings::ConnectionSettings;
+    use rsipstack::sip::prelude::HeadersExt;
+    use rsipstack::transport::udp::UdpConnection;
+    use rsipstack::transport::{
+        TcpListenerConnection, TlsConfig, TlsListenerConnection, TransportLayer,
+        WebSocketListenerConnection,
+    };
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// A station that answers every REGISTER with 200 OK and remembers the Contact it was given.
+    struct Station {
+        port: u16,
+        contacts: Arc<Mutex<Vec<String>>>,
+        cancel: CancellationToken,
+    }
+
+    impl Drop for Station {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+        }
+    }
+
+    async fn start_station(transport: TransportKind, tls: Option<TlsConfig>) -> Station {
+        let cancel = CancellationToken::new();
+        let port = free_port();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let layer = TransportLayer::new(cancel.clone());
+        match transport {
+            TransportKind::Udp => layer.add_transport(
+                UdpConnection::create_connection(addr, None, Some(cancel.clone()))
+                    .await
+                    .unwrap()
+                    .into(),
+            ),
+            TransportKind::Tcp => {
+                layer.add_transport(TcpListenerConnection::new(addr, None).await.unwrap().into())
+            }
+            TransportKind::Tls => layer.add_transport(
+                TlsListenerConnection::new(addr, None, tls.expect("TLS needs a certificate"))
+                    .await
+                    .unwrap()
+                    .into(),
+            ),
+            TransportKind::Ws => layer.add_transport(
+                WebSocketListenerConnection::new(addr, None, false)
+                    .await
+                    .unwrap()
+                    .into(),
+            ),
+            TransportKind::Wss => panic!("not tested"),
+        }
+        let mut builder = rsipstack::EndpointBuilder::new();
+        builder.with_transport_layer(layer);
+        builder.with_cancel_token(cancel.clone());
+        let endpoint = builder.build();
+        let inner = endpoint.inner.clone();
+        tokio::spawn(async move {
+            let _ = inner.serve().await;
+        });
+        let mut incoming = endpoint.incoming_transactions().unwrap();
+        let contacts = Arc::new(Mutex::new(Vec::new()));
+        let seen = contacts.clone();
+        tokio::spawn(async move {
+            let _keep_alive = &endpoint;
+            while let Some(mut transaction) = incoming.recv().await {
+                if let Ok(contact) = transaction.original.contact_header() {
+                    seen.lock().unwrap().push(contact.to_string());
+                }
+                let _ = transaction.reply(StatusCode::OK).await;
+            }
+        });
+        // Let the listener come up before the phone dials.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        Station {
+            port,
+            contacts,
+            cancel,
+        }
+    }
+
+    fn account(port: u16, transport: TransportKind, ca_path: &str) -> Account {
+        Account {
+            server: format!("127.0.0.1:{port}"),
+            extension: "300".into(),
+            password: "secret".into(),
+            connection: ConnectionSettings {
+                transport,
+                ca_path: ca_path.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Starts the phone core with `account` and returns the first verdict on its registration.
+    async fn first_registration_state(account: Account) -> RegState {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = Events::new(tx, Arc::new(|| {}));
+        let session = Session::start(
+            account,
+            events,
+            Arc::new(CallSlot::default()),
+            Arc::new(Mutex::new(AudioSettings::default())),
+        )
+        .await
+        .expect("the session starts");
+        let state = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match rx.try_recv() {
+                    Ok(Event::Reg(state @ (RegState::Online | RegState::Failed { .. }))) => {
+                        return state;
+                    }
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("a registration verdict within 10 seconds");
+        session.stop().await;
+        state
+    }
+
+    #[tokio::test]
+    async fn registers_over_udp() {
+        let station = start_station(TransportKind::Udp, None).await;
+        let state = first_registration_state(account(station.port, TransportKind::Udp, "")).await;
+        assert_eq!(state, RegState::Online);
+        let contacts = station.contacts.lock().unwrap().clone();
+        assert!(!contacts.is_empty());
+        assert!(
+            contacts
+                .iter()
+                .all(|c| !c.to_lowercase().contains("transport=")),
+            "UDP contacts carry no transport: {contacts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registers_over_tcp_and_says_so_in_the_contact() {
+        let station = start_station(TransportKind::Tcp, None).await;
+        let state = first_registration_state(account(station.port, TransportKind::Tcp, "")).await;
+        assert_eq!(state, RegState::Online);
+        let contacts = station.contacts.lock().unwrap().clone();
+        assert!(
+            contacts
+                .iter()
+                .any(|c| c.to_lowercase().contains("transport=tcp")),
+            "the contact must name TCP so the station calls back over it: {contacts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registers_over_websocket() {
+        let station = start_station(TransportKind::Ws, None).await;
+        let state = first_registration_state(account(station.port, TransportKind::Ws, "")).await;
+        assert_eq!(state, RegState::Online);
+        let contacts = station.contacts.lock().unwrap().clone();
+        assert!(
+            contacts
+                .iter()
+                .any(|c| c.to_lowercase().contains("transport=ws")),
+            "{contacts:?}"
+        );
+    }
+
+    fn self_signed() -> (TlsConfig, String) {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let pem = cert.pem();
+        let config = TlsConfig {
+            cert: Some(pem.clone().into_bytes()),
+            key: Some(signing_key.serialize_pem().into_bytes()),
+            ..Default::default()
+        };
+        (config, pem)
+    }
+
+    #[tokio::test]
+    async fn registers_over_tls_when_the_certificate_is_trusted() {
+        let (config, pem) = self_signed();
+        let station = start_station(TransportKind::Tls, Some(config)).await;
+        let ca_file = std::env::temp_dir().join(format!("rsp-test-ca-{}.pem", station.port));
+        std::fs::write(&ca_file, pem).unwrap();
+        let state = first_registration_state(account(
+            station.port,
+            TransportKind::Tls,
+            ca_file.to_str().unwrap(),
+        ))
+        .await;
+        let _ = std::fs::remove_file(&ca_file);
+        assert_eq!(state, RegState::Online);
+        let contacts = station.contacts.lock().unwrap().clone();
+        assert!(
+            contacts
+                .iter()
+                .any(|c| c.to_lowercase().contains("transport=tls")),
+            "{contacts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_with_an_unknown_certificate_is_refused_with_a_clear_notice() {
+        let (config, _pem) = self_signed();
+        let station = start_station(TransportKind::Tls, Some(config)).await;
+        // No extra CA given: a self-signed station certificate must not be trusted.
+        let state = first_registration_state(account(station.port, TransportKind::Tls, "")).await;
+        assert!(
+            matches!(
+                state,
+                RegState::Failed {
+                    notice: Notice::TlsProblem(_),
+                    retry: false
+                }
+            ),
+            "{state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_station_is_reported_and_retried() {
+        // Nothing listens on this port.
+        let state = first_registration_state(account(free_port(), TransportKind::Tcp, "")).await;
+        assert!(
+            matches!(
+                state,
+                RegState::Failed {
+                    notice: Notice::ConnectionFailed(_),
+                    retry: true
+                }
+            ),
+            "{state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_certificate_file_is_reported_by_path() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let events = Events::new(tx, Arc::new(|| {}));
+        let result = Session::start(
+            account(5061, TransportKind::Tls, "/definitely/not/here.pem"),
+            events,
+            Arc::new(CallSlot::default()),
+            Arc::new(Mutex::new(AudioSettings::default())),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(Notice::CertificateFileUnreadable(path)) if path == "/definitely/not/here.pem"
+        ));
+    }
+
+    #[test]
+    fn outbound_address_depends_on_transport_domain_and_proxy() {
+        let mut a = account(5060, TransportKind::Udp, "");
+        assert!(outbound_addr(&a).is_none(), "plain UDP needs none");
+
+        a.connection.transport = TransportKind::Tcp;
+        let tcp = outbound_addr(&a).expect("a stream transport pins the address");
+        assert_eq!(tcp.r#type, Some(rsipstack::sip::Transport::Tcp));
+
+        a.connection.transport = TransportKind::Udp;
+        a.connection.domain = "example.com".into();
+        assert!(
+            outbound_addr(&a).is_some(),
+            "a different domain pins the station"
+        );
+
+        a.connection.domain.clear();
+        a.connection.outbound_proxy = "proxy.example.com".into();
+        let proxy = outbound_addr(&a).unwrap();
+        assert_eq!(proxy.addr.to_string(), "proxy.example.com");
+
+        // A name without a port is left open for SRV; an IP gets the default port.
+        assert_eq!(
+            sip_addr("pbx.example.com", None, TransportKind::Tls)
+                .addr
+                .port,
+            None
+        );
+        assert_eq!(
+            sip_addr("10.0.0.1", None, TransportKind::Tls).addr.port,
+            Some(5061.into())
+        );
     }
 }

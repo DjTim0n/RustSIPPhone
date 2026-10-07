@@ -35,7 +35,7 @@ pub async fn run(
     remote: Remote,
     mut audio: AudioIo,
     control: MediaControl,
-    signalling_ip: IpAddr,
+    signalling_ips: Vec<IpAddr>,
     stop: CancellationToken,
 ) -> MediaStats {
     // Audio captured while dialling is not needed.
@@ -46,7 +46,7 @@ pub async fn run(
     let codec = remote.codec;
     let dtmf_pt = remote.dtmf_pt;
 
-    let filter = PeerFilter::new(remote.addr.ip(), signalling_ip);
+    let filter = PeerFilter::new(remote.addr.ip(), &signalling_ips);
     let ((), received) = tokio::join!(
         send_loop(
             &socket,
@@ -266,9 +266,11 @@ struct PeerFilter {
 }
 
 impl PeerFilter {
-    fn new(sdp_ip: IpAddr, signalling_ip: IpAddr) -> Self {
+    fn new(sdp_ip: IpAddr, signalling_ips: &[IpAddr]) -> Self {
+        let mut trusted = vec![sdp_ip];
+        trusted.extend_from_slice(signalling_ips);
         PeerFilter {
-            trusted: vec![sdp_ip, signalling_ip],
+            trusted,
             allow_nat_learning: !is_publicly_routable(sdp_ip),
             pinned: None,
             candidate: None,
@@ -383,7 +385,7 @@ mod tests {
     fn pins_first_trusted_source_and_ssrc() {
         let mut f = PeerFilter::new(
             "203.0.113.5".parse().unwrap(),
-            "203.0.113.9".parse().unwrap(),
+            &["203.0.113.9".parse().unwrap()],
         );
         let t = Duration::ZERO;
         assert_eq!(
@@ -409,7 +411,7 @@ mod tests {
     fn stranger_cannot_pin_before_the_real_peer() {
         let mut f = PeerFilter::new(
             "203.0.113.5".parse().unwrap(),
-            "203.0.113.9".parse().unwrap(),
+            &["203.0.113.9".parse().unwrap()],
         );
         for seq in 0..50 {
             assert_eq!(
@@ -431,7 +433,7 @@ mod tests {
     fn signalling_server_is_trusted() {
         let mut f = PeerFilter::new(
             "203.0.113.5".parse().unwrap(),
-            "203.0.113.9".parse().unwrap(),
+            &["203.0.113.9".parse().unwrap()],
         );
         assert_eq!(
             f.check(addr("203.0.113.9:20000"), &header(1, 1), Duration::ZERO),
@@ -444,7 +446,7 @@ mod tests {
         // SDP says 192.168.1.20, but the audio really comes from a public address.
         let mut f = PeerFilter::new(
             "192.168.1.20".parse().unwrap(),
-            "203.0.113.9".parse().unwrap(),
+            &["203.0.113.9".parse().unwrap()],
         );
         let src = addr("198.51.100.7:5004");
         for seq in 10..14 {
@@ -462,14 +464,20 @@ mod tests {
     #[test]
     fn nat_learning_rejects_gaps_late_and_public_sdp() {
         let src = addr("198.51.100.7:5004");
-        let mut gap = PeerFilter::new("10.0.0.2".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        let mut gap = PeerFilter::new(
+            "10.0.0.2".parse().unwrap(),
+            &["203.0.113.9".parse().unwrap()],
+        );
         for seq in [1u16, 2, 4, 5, 6, 8, 9] {
             assert_eq!(
                 gap.check(src, &header(3, seq), Duration::from_secs(1)),
                 Verdict::Drop
             );
         }
-        let mut late = PeerFilter::new("10.0.0.2".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        let mut late = PeerFilter::new(
+            "10.0.0.2".parse().unwrap(),
+            &["203.0.113.9".parse().unwrap()],
+        );
         for seq in 0..20 {
             assert_eq!(
                 late.check(src, &header(3, seq), Duration::from_secs(30)),
@@ -479,7 +487,7 @@ mod tests {
         // A publicly routable SDP address means "no NAT": never learn a different IP.
         let mut public = PeerFilter::new(
             "203.0.113.5".parse().unwrap(),
-            "203.0.113.9".parse().unwrap(),
+            &["203.0.113.9".parse().unwrap()],
         );
         for seq in 0..20 {
             assert_eq!(

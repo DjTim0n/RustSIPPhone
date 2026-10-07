@@ -1,16 +1,64 @@
 //! Shared types: what the phone core can do and what it reports to the interface.
 
+use crate::settings::{
+    AudioSettings, ConnectionSettings, escape_user, host_for_uri, split_host_port,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Account {
-    /// Station (PBX) address with the port, for example `192.168.1.10:5060`.
+    /// Station (PBX) address as typed: a name or an IP, with an optional port.
     pub server: String,
     /// Extension number (also the login).
     pub extension: String,
     pub password: String,
+    pub connection: ConnectionSettings,
+}
+
+impl Account {
+    pub fn server_host_port(&self) -> (String, Option<u16>) {
+        split_host_port(&self.server)
+    }
+
+    /// The host that goes after the `@` in SIP addresses: the SIP domain if one is set (without a
+    /// port), otherwise the station address exactly as typed.
+    fn uri_host(&self) -> String {
+        let domain = self.connection.domain.trim();
+        if domain.is_empty() {
+            let (host, port) = self.server_host_port();
+            host_for_uri(&host, port)
+        } else {
+            domain.to_string()
+        }
+    }
+
+    /// Our own address, for example `sip:300@pbx.example.com`.
+    pub fn own_uri(&self) -> String {
+        format!("sip:{}@{}", escape_user(&self.extension), self.uri_host())
+    }
+
+    /// Where to register. The transport is not part of the address: the transport layer sends
+    /// everything to the outbound address, which carries it.
+    pub fn register_uri(&self) -> String {
+        format!("sip:{}", self.uri_host())
+    }
+
+    /// The address to call for what the user typed: a plain number goes to our own station, a
+    /// full address (`name@host`, with or without `sip:`) is used as it is.
+    pub fn callee_uri(&self, dialled: &str) -> String {
+        let dialled = dialled.trim();
+        let bare = dialled
+            .strip_prefix("sips:")
+            .or_else(|| dialled.strip_prefix("sip:"))
+            .unwrap_or(dialled);
+        if bare.contains('@') {
+            format!("sip:{bare}")
+        } else {
+            format!("sip:{}@{}", escape_user(bare), self.uri_host())
+        }
+    }
 }
 
 /// What the interface asks the core to do.
@@ -24,6 +72,8 @@ pub enum Command {
     Hangup,
     SetMute(bool),
     Dtmf(char),
+    /// Use these microphone and speaker for the calls that follow.
+    SetAudio(AudioSettings),
     Shutdown,
 }
 
@@ -149,8 +199,63 @@ pub enum Notice {
     PeerEndedCall,
     NoAudioReceived,
     PasswordNotSaved,
+    /// The connection to the station could not be set up; the text is the technical reason.
+    ConnectionFailed(String),
+    /// The secure connection failed, usually because of the station's certificate.
+    TlsProblem(String),
+    /// The extra certificate file could not be read.
+    CertificateFileUnreadable(String),
 }
 
 /// Stored in place of a caller's number when the request does not say who is calling.
 /// The interface shows it as a localized "Unknown number".
 pub const UNKNOWN_PEER: &str = "?";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::TransportKind;
+
+    fn account(server: &str, domain: &str, transport: TransportKind) -> Account {
+        Account {
+            server: server.into(),
+            extension: "300".into(),
+            password: "x".into(),
+            connection: ConnectionSettings {
+                domain: domain.into(),
+                transport,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn plain_account_uses_the_station_address() {
+        let a = account("10.0.0.1:5060", "", TransportKind::Udp);
+        assert_eq!(a.own_uri(), "sip:300@10.0.0.1:5060");
+        assert_eq!(a.register_uri(), "sip:10.0.0.1:5060");
+    }
+
+    #[test]
+    fn domain_replaces_the_station_in_uris() {
+        let a = account("sbc1.example.com:5061", "example.com", TransportKind::Tls);
+        assert_eq!(a.own_uri(), "sip:300@example.com");
+        assert_eq!(a.register_uri(), "sip:example.com");
+    }
+
+    #[test]
+    fn callee_uri_handles_numbers_and_full_addresses() {
+        let a = account("pbx.example.com", "", TransportKind::Udp);
+        assert_eq!(a.callee_uri("100"), "sip:100@pbx.example.com");
+        assert_eq!(a.callee_uri("*43#"), "sip:*43%23@pbx.example.com");
+        assert_eq!(a.callee_uri("bob@other.org"), "sip:bob@other.org");
+        assert_eq!(a.callee_uri("sip:bob@other.org"), "sip:bob@other.org");
+        assert_eq!(a.callee_uri(" 100 "), "sip:100@pbx.example.com");
+    }
+
+    #[test]
+    fn ipv6_station_is_bracketed() {
+        let a = account("[2001:db8::1]:5060", "", TransportKind::Udp);
+        assert_eq!(a.own_uri(), "sip:300@[2001:db8::1]:5060");
+    }
+}
