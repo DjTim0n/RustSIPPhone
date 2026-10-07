@@ -526,8 +526,11 @@ async fn incoming(
         return Finished::failed(Notice::AnswerFailed);
     }
 
-    let media = start_media(ctx, rtp_socket, audio, remote, false, session_id);
-    let start_muted = matches!(decision, Ok(Decision::AutoAnswer));
+    // The microphone must be off from the very first audio frame of an auto-answered call, so the
+    // media starts muted instead of being muted afterwards: there is no moment in between when
+    // sound from the room could be sent.
+    let start_muted = matches!(&decision, Ok(d) if d.starts_muted());
+    let media = start_media(ctx, rtp_socket, audio, remote, start_muted, session_id);
     let result = talk(
         ctx,
         &dialog,
@@ -540,6 +543,13 @@ async fn incoming(
     .await;
     ctx.dialog_layer.remove_dialog(&dialog.id());
     result
+}
+
+impl Decision {
+    /// Whether a call answered this way starts with the microphone off.
+    fn starts_muted(&self) -> bool {
+        matches!(self, Decision::AutoAnswer)
+    }
 }
 
 enum Decision {
@@ -1238,5 +1248,12 @@ mod tests {
         assert!(is_refer_notify(&notify("refer")));
         assert!(is_refer_notify(&notify("refer;id=4")));
         assert!(!is_refer_notify(&notify("message-summary")));
+    }
+
+    #[test]
+    fn only_an_auto_answered_call_starts_muted() {
+        assert!(Decision::AutoAnswer.starts_muted());
+        assert!(!Decision::Answer.starts_muted());
+        assert!(!Decision::Decline.starts_muted());
     }
 }
