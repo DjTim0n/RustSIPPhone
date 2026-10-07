@@ -27,7 +27,7 @@ Sign in to your PBX, dial a number, answer calls — on macOS, Windows and Linux
 - **Recent calls** — incoming, outgoing and missed, one click to call back.
 - **In-call controls** — mute, keypad tones (DTMF) for voice menus, hang up.
 - **Ringtone** that plays on every platform, with nothing extra to install.
-- **Runs in the background.** Closing the window minimizes it to the Dock or taskbar and the phone stays registered, so it can still ring. An incoming call restores the window, raises it above other windows, gives it focus and bounces the Dock icon / flashes the taskbar button.
+- **Runs in the background.** Closing the window does not quit the app, so the phone stays registered and can still ring. On macOS the window simply goes away, as in any Mac app, and a click on the Dock icon brings it back; on Windows and Linux it is minimized to the taskbar. An incoming call restores the window, raises it above other windows, gives it focus and bounces the Dock icon / flashes the taskbar button.
 - **Two interface languages:** **English** (the default) and **Russian**. Pick it from a drop-down list on the sign-in screen or in the top bar at any time; the choice is remembered.
 - **Single small binary.** No runtime, no installer required.
 

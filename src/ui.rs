@@ -62,6 +62,8 @@ pub struct PhoneApp {
     toast: Option<(Notice, Instant)>,
     /// The user chose to quit, so the next close request really closes the window.
     quitting: bool,
+    /// The window was sent to the background and has not been brought back yet.
+    in_background: bool,
 }
 
 impl PhoneApp {
@@ -99,6 +101,7 @@ impl PhoneApp {
             keypad_open: false,
             toast: None,
             quitting: false,
+            in_background: false,
         };
         app.try_auto_login();
         app
@@ -261,10 +264,25 @@ impl eframe::App for PhoneApp {
     /// an incoming call has to bring the window back even when nothing is on screen.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events(ctx);
-        if ctx.input(|i| i.viewport().close_requested()) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
             for command in window::close_request_commands(self.quitting) {
                 ctx.send_viewport_cmd(command);
             }
+            window::hide_application();
+            self.in_background = true;
+        }
+        // The window is back after being in the background (Dock click, taskbar, a call):
+        // make sure it is the active window and gets redrawn at once.
+        if self.in_background
+            && ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::WindowFocused(true)))
+            })
+        {
+            self.in_background = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
         }
     }
 
@@ -326,9 +344,11 @@ impl eframe::App for PhoneApp {
         // Ask the core to hang up and unregister, and wait for it briefly.
         self.send(Command::Shutdown);
         if let Some(engine) = self.engine.take() {
+            // `timeout` creates a timer, which needs the runtime to be running already, so it
+            // must be built inside the future and not as the argument of `block_on`.
             let _ = self
                 .runtime
-                .block_on(tokio::time::timeout(Duration::from_secs(8), engine));
+                .block_on(async { tokio::time::timeout(Duration::from_secs(8), engine).await });
         }
     }
 }
