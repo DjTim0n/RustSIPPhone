@@ -1,7 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Телефон
-Comment=Звонки по SIP
+Name=RustSIPPhone
+Name[ru]=RustSIPPhone
+Comment=SIP softphone
+Comment[ru]=Звонки по SIP
 Exec=rust_sip_phone
 Icon=rustsipphone
 Terminal=false

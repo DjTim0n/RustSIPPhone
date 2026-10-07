@@ -1,12 +1,12 @@
-//! Построение SDP и разбор SDP собеседника (один аудио-поток G.711 + DTMF по RFC 4733).
+//! Building SDP and parsing the other side's SDP (one G.711 audio stream + DTMF per RFC 4733).
 
 use crate::g711::Codec;
 use std::net::{IpAddr, SocketAddr};
 
-/// Payload type для DTMF, который мы предлагаем сами.
+/// Payload type for DTMF that we offer ourselves.
 pub const DEFAULT_DTMF_PT: u8 = 101;
 
-/// Собирает SDP. `codecs` — в порядке предпочтения, `dtmf_pt` — номер для telephone-event.
+/// Builds SDP. `codecs` are in order of preference, `dtmf_pt` is the number for telephone-event.
 pub fn build_sdp(
     local_ip: IpAddr,
     rtp_port: u16,
@@ -63,7 +63,7 @@ pub struct Remote {
     pub dtmf_pt: Option<u8>,
 }
 
-/// Разбирает SDP собеседника (и ответ на наш оффер, и его оффер на входящем звонке).
+/// Parses the other side's SDP (both the answer to our offer and its offer on an incoming call).
 pub fn parse_remote(sdp: &str) -> Result<Remote, String> {
     let mut session_ip: Option<IpAddr> = None;
     let mut media_ip: Option<IpAddr> = None;
@@ -80,7 +80,7 @@ pub fn parse_remote(sdp: &str) -> Result<Remote, String> {
                     .next()
                     .and_then(|p| p.split('/').next())
                     .and_then(|p| p.parse::<u16>().ok())
-                    .ok_or("некорректный порт в m=audio")?;
+                    .ok_or("invalid port in m=audio")?;
                 let formats = parts.skip(1).filter_map(|f| f.parse::<u8>().ok()).collect();
                 media = Some((port, formats));
             }
@@ -107,15 +107,17 @@ pub fn parse_remote(sdp: &str) -> Result<Remote, String> {
         }
     }
 
-    let (port, formats) = media.ok_or("в SDP нет аудио-потока")?;
+    let (port, formats) = media.ok_or("the SDP has no audio stream")?;
     if port == 0 {
-        return Err("собеседник отклонил аудио (порт 0)".into());
+        return Err("the other side rejected audio (port 0)".into());
     }
-    let ip = media_ip.or(session_ip).ok_or("в SDP нет адреса (c=)")?;
+    let ip = media_ip
+        .or(session_ip)
+        .ok_or("the SDP has no address (c=)")?;
     let codec = formats
         .iter()
         .find_map(|&pt| Codec::from_payload_type(pt))
-        .ok_or("нет общего кодека: поддерживаются только PCMU и PCMA")?;
+        .ok_or("no common codec: only PCMU and PCMA are supported")?;
     Ok(Remote {
         addr: SocketAddr::new(ip, port),
         codec,

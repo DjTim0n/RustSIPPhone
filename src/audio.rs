@@ -1,7 +1,7 @@
-//! Микрофон и динамик через cpal. Снаружи звук всегда моно, 8 кГц, i16.
+//! Microphone and speaker through cpal. Outside this module audio is always mono, 8 kHz, i16.
 //!
-//! cpal-потоки не `Send` на некоторых платформах, поэтому живут в отдельном потоке,
-//! а с асинхронным миром общаются через канал (микрофон) и общую очередь (динамик).
+//! cpal streams are not `Send` on some platforms, so they live on their own thread
+//! and talk to the async world through a channel (microphone) and a shared queue (speaker).
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
@@ -10,17 +10,17 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 pub const SAMPLE_RATE: u32 = 8000;
-/// Сколько миллисекунд накопить в очереди динамика перед началом воспроизведения.
+/// How many milliseconds to buffer in the speaker queue before playback starts.
 const PREBUFFER_MS: usize = 60;
-/// Максимальная задержка очереди воспроизведения; всё, что сверх, отбрасывается.
+/// Maximum playback queue delay; anything beyond it is dropped.
 const MAX_QUEUE_MS: usize = 400;
 
 pub type SpeakerQueue = Arc<Mutex<Playback>>;
 
 pub struct AudioIo {
-    /// Блоки моно-звука 8 кГц от микрофона (размер блока произвольный).
+    /// Blocks of mono 8 kHz audio from the microphone (block size is arbitrary).
     pub mic: mpsc::Receiver<Vec<i16>>,
-    /// Очередь, в которую складываются декодированные сэмплы собеседника.
+    /// Queue that receives the other side's decoded samples.
     pub speaker: SpeakerQueue,
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -38,7 +38,7 @@ impl AudioIo {
             match build_streams(mic_tx, speaker_for_thread) {
                 Ok(streams) => {
                     let _ = ready_tx.send(Ok(()));
-                    // Ждём команды остановки (или закрытия канала), потом потоки сбросятся.
+                    // Wait for the stop signal (or the channel closing); the streams are dropped afterwards.
                     let _ = stop_rx.recv();
                     drop(streams);
                 }
@@ -59,7 +59,7 @@ impl AudioIo {
                 let _ = thread.join();
                 Err(err)
             }
-            Err(_) => Err("аудио-поток неожиданно завершился".into()),
+            Err(_) => Err("the audio thread ended unexpectedly".into()),
         }
     }
 }
@@ -73,7 +73,7 @@ impl Drop for AudioIo {
     }
 }
 
-/// Очередь воспроизведения с предварительной буферизацией.
+/// Playback queue with pre-buffering.
 #[derive(Default)]
 pub struct Playback {
     queue: VecDeque<i16>,
@@ -99,7 +99,7 @@ impl Playback {
         }
         let sample = self.queue.pop_front();
         if sample.is_none() {
-            // Очередь опустела: снова накопим небольшой запас, чтобы не «дребезжало».
+            // The queue ran dry: build up a small reserve again so playback does not stutter.
             self.started = false;
         }
         sample
@@ -115,13 +115,17 @@ fn build_streams(mic_tx: mpsc::Sender<Vec<i16>>, speaker: SpeakerQueue) -> Resul
     let host = cpal::default_host();
     let input_device = host
         .default_input_device()
-        .ok_or("не найден микрофон (проверьте доступ к микрофону в настройках системы)")?;
-    let output_device = host.default_output_device().ok_or("не найден динамик")?;
+        .ok_or("no microphone found (check microphone access in system settings)")?;
+    let output_device = host.default_output_device().ok_or("no speaker found")?;
 
     let input = build_input(&input_device, mic_tx)?;
     let output = build_output(&output_device, speaker)?;
-    input.play().map_err(|e| format!("запуск микрофона: {e}"))?;
-    output.play().map_err(|e| format!("запуск динамика: {e}"))?;
+    input
+        .play()
+        .map_err(|e| format!("starting the microphone: {e}"))?;
+    output
+        .play()
+        .map_err(|e| format!("starting the speaker: {e}"))?;
     Ok(Streams {
         _input: input,
         _output: output,
@@ -131,7 +135,7 @@ fn build_streams(mic_tx: mpsc::Sender<Vec<i16>>, speaker: SpeakerQueue) -> Resul
 fn build_input(device: &cpal::Device, tx: mpsc::Sender<Vec<i16>>) -> Result<cpal::Stream, String> {
     let supported = device
         .default_input_config()
-        .map_err(|e| format!("конфигурация микрофона: {e}"))?;
+        .map_err(|e| format!("microphone configuration: {e}"))?;
     let format = supported.sample_format();
     let config: StreamConfig = supported.into();
     match format {
@@ -139,14 +143,16 @@ fn build_input(device: &cpal::Device, tx: mpsc::Sender<Vec<i16>>) -> Result<cpal
         SampleFormat::I16 => input_stream::<i16>(device, config, tx),
         SampleFormat::U16 => input_stream::<u16>(device, config, tx),
         SampleFormat::I32 => input_stream::<i32>(device, config, tx),
-        other => Err(format!("формат микрофона {other:?} не поддерживается")),
+        other => Err(format!(
+            "microphone sample format {other:?} is not supported"
+        )),
     }
 }
 
 fn build_output(device: &cpal::Device, queue: SpeakerQueue) -> Result<cpal::Stream, String> {
     let supported = device
         .default_output_config()
-        .map_err(|e| format!("конфигурация динамика: {e}"))?;
+        .map_err(|e| format!("speaker configuration: {e}"))?;
     let format = supported.sample_format();
     let config: StreamConfig = supported.into();
     match format {
@@ -154,7 +160,7 @@ fn build_output(device: &cpal::Device, queue: SpeakerQueue) -> Result<cpal::Stre
         SampleFormat::I16 => output_stream::<i16>(device, config, queue),
         SampleFormat::U16 => output_stream::<u16>(device, config, queue),
         SampleFormat::I32 => output_stream::<i32>(device, config, queue),
-        other => Err(format!("формат динамика {other:?} не поддерживается")),
+        other => Err(format!("speaker sample format {other:?} is not supported")),
     }
 }
 
@@ -182,14 +188,14 @@ where
                     }
                 }
                 if !out.is_empty() {
-                    // Если потребитель не успевает (звонок ещё не принят) — старый звук не копим.
+                    // If the consumer is not keeping up (the call is not answered yet), do not pile up old audio.
                     let _ = tx.try_send(out);
                 }
             },
-            |err| eprintln!("ошибка микрофона: {err}"),
+            |err| eprintln!("microphone error: {err}"),
             None,
         )
-        .map_err(|e| format!("открытие микрофона: {e}"))
+        .map_err(|e| format!("opening the microphone: {e}"))
 }
 
 fn output_stream<T>(
@@ -213,13 +219,13 @@ where
                     frame.fill(value);
                 }
             },
-            |err| eprintln!("ошибка динамика: {err}"),
+            |err| eprintln!("speaker error: {err}"),
             None,
         )
-        .map_err(|e| format!("открытие динамика: {e}"))
+        .map_err(|e| format!("opening the speaker: {e}"))
 }
 
-/// Потоковое понижение частоты усреднением окна (грубо, но без сильного алиасинга).
+/// Streaming downsampler that averages a window (crude, but without heavy aliasing).
 struct Downsampler {
     ratio: f64,
     phase: f64,
@@ -253,7 +259,7 @@ impl Downsampler {
     }
 }
 
-/// Потоковое повышение частоты линейной интерполяцией.
+/// Streaming upsampler using linear interpolation.
 struct Upsampler {
     step: f64,
     pos: f64,
@@ -318,7 +324,7 @@ mod tests {
     fn playback_prebuffers_then_drains() {
         let mut p = Playback::default();
         p.push(&[1; 100]);
-        assert_eq!(p.pop(), None); // ещё копим запас
+        assert_eq!(p.pop(), None); // still building up the reserve
         p.push(&[1; 400]);
         assert_eq!(p.pop(), Some(1));
     }

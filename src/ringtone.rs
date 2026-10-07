@@ -1,5 +1,5 @@
-//! Сигнал входящего звонка. Синтезируется на лету и играет через cpal,
-//! поэтому звучит одинаково на macOS, Windows и Linux и не требует звуковых файлов.
+//! Incoming-call ringtone. It is synthesized on the fly and played through cpal,
+//! so it sounds the same on macOS, Windows and Linux and needs no sound files.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
@@ -10,11 +10,11 @@ pub struct Ringtone {
 }
 
 impl Ringtone {
-    /// Начинает играть сигнал, пока объект не будет сброшен.
+    /// Starts playing the tone until the object is dropped.
     pub fn start() -> Result<Ringtone, String> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-        // Поток cpal не `Send` на некоторых платформах, поэтому он живёт в отдельном потоке.
+        // The cpal stream is not `Send` on some platforms, so it lives on its own thread.
         let thread = std::thread::spawn(move || match build_stream() {
             Ok(stream) => {
                 let _ = ready_tx.send(Ok(()));
@@ -34,7 +34,7 @@ impl Ringtone {
                 let _ = thread.join();
                 Err(err)
             }
-            Err(_) => Err("поток сигнала неожиданно завершился".into()),
+            Err(_) => Err("the ringtone thread ended unexpectedly".into()),
         }
     }
 }
@@ -51,10 +51,10 @@ impl Drop for Ringtone {
 fn build_stream() -> Result<cpal::Stream, String> {
     let device = cpal::default_host()
         .default_output_device()
-        .ok_or("не найден динамик")?;
+        .ok_or("no speaker found")?;
     let supported = device
         .default_output_config()
-        .map_err(|e| format!("конфигурация динамика: {e}"))?;
+        .map_err(|e| format!("speaker configuration: {e}"))?;
     let format = supported.sample_format();
     let config: StreamConfig = supported.into();
     let stream = match format {
@@ -62,9 +62,11 @@ fn build_stream() -> Result<cpal::Stream, String> {
         SampleFormat::I16 => stream_for::<i16>(&device, config),
         SampleFormat::U16 => stream_for::<u16>(&device, config),
         SampleFormat::I32 => stream_for::<i32>(&device, config),
-        other => Err(format!("формат динамика {other:?} не поддерживается")),
+        other => Err(format!("speaker sample format {other:?} is not supported")),
     }?;
-    stream.play().map_err(|e| format!("запуск динамика: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("starting the speaker: {e}"))?;
     Ok(stream)
 }
 
@@ -82,15 +84,15 @@ where
                     frame.fill(T::from_sample(synth.next()));
                 }
             },
-            |err| eprintln!("ошибка динамика: {err}"),
+            |err| eprintln!("speaker error: {err}"),
             None,
         )
-        .map_err(|e| format!("открытие динамика: {e}"))
+        .map_err(|e| format!("opening the speaker: {e}"))
 }
 
-/// Длина всего цикла «двойной звонок + пауза», секунды.
+/// Length of the whole "double ring + pause" cycle, in seconds.
 const CYCLE: f32 = 3.0;
-/// Участки цикла, где звучит сигнал: (начало, конец).
+/// Parts of the cycle where the tone sounds: (start, end).
 const BURSTS: [(f32, f32); 2] = [(0.0, 0.4), (0.6, 1.0)];
 const FADE: f32 = 0.02;
 const VOLUME: f32 = 0.18;
@@ -146,7 +148,10 @@ mod tests {
                 quiet_tail = false;
             }
         }
-        assert!(loud_frames > 3000, "сигнал должен звучать: {loud_frames}");
-        assert!(quiet_tail, "после двух звонков должна быть тишина");
+        assert!(
+            loud_frames > 3000,
+            "the tone should be audible: {loud_frames}"
+        );
+        assert!(quiet_tail, "there should be silence after the two rings");
     }
 }

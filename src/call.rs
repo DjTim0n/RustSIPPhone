@@ -1,4 +1,4 @@
-//! Звонки: исходящий (INVITE) и входящий, разговор с RTP-медиа, завершение.
+//! Calls: outgoing (INVITE) and incoming, the conversation with RTP media, and teardown.
 
 use crate::audio::AudioIo;
 use crate::media::{self, MediaControl};
@@ -21,7 +21,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
-/// Сколько телефон звонит, пока никто не ответил.
+/// How long the phone rings before an unanswered incoming call is given up.
 const INCOMING_RING_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug)]
@@ -33,7 +33,7 @@ pub enum CallCtl {
     Dtmf(char),
 }
 
-/// Одновременно у нас не больше одного звонка.
+/// We never have more than one call at a time.
 #[derive(Default)]
 pub struct CallSlot(Mutex<Option<UnboundedSender<CallCtl>>>);
 
@@ -80,23 +80,23 @@ pub struct CallContext {
 
 struct Finished {
     outcome: Outcome,
-    message: Option<String>,
+    notice: Option<Notice>,
     connected_at: Option<Instant>,
 }
 
 impl Finished {
-    fn failed(message: impl Into<String>) -> Self {
+    fn failed(notice: Notice) -> Self {
         Finished {
             outcome: Outcome::Failed,
-            message: Some(message.into()),
+            notice: Some(notice),
             connected_at: None,
         }
     }
 
-    fn without_talk(outcome: Outcome, message: Option<String>) -> Self {
+    fn without_talk(outcome: Outcome, notice: Option<Notice>) -> Self {
         Finished {
             outcome,
-            message,
+            notice,
             connected_at: None,
         }
     }
@@ -123,16 +123,16 @@ fn finish(ctx: &CallContext, direction: Direction, peer: &str, started_at: i64, 
             started_at,
             duration_secs,
         },
-        message: done.message,
+        notice: done.notice,
     });
     ctx.events.send(Event::Call(None));
 }
 
-// ---------------------------------------------------------------- исходящий
+// ---------------------------------------------------------------- outgoing
 
-pub fn start_outgoing(ctx: CallContext, number: String) -> Result<(), String> {
+pub fn start_outgoing(ctx: CallContext, number: String) -> Result<(), Notice> {
     let Some((ctl_rx, guard)) = ctx.slot.claim() else {
-        return Err("Сначала завершите текущий звонок".into());
+        return Err(Notice::FinishCurrentCall);
     };
     tokio::spawn(async move {
         let _guard = guard;
@@ -151,14 +151,14 @@ async fn outgoing(
 ) -> Finished {
     let account = &ctx.account;
 
-    // Устройства открываем до INVITE: если нет доступа к микрофону, лучше узнать сразу.
+    // Open the devices before the INVITE: if microphone access is missing, better to learn it right away.
     let audio = match AudioIo::start() {
         Ok(audio) => audio,
-        Err(err) => return Finished::failed(audio_error_text(&err)),
+        Err(err) => return Finished::failed(Notice::AudioUnavailable(err)),
     };
     let rtp_socket = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(socket) => Arc::new(socket),
-        Err(err) => return Finished::failed(format!("Не удалось подготовить звук: {err}")),
+        Err(err) => return Finished::failed(Notice::SoundSetupFailed(err.to_string())),
     };
     let rtp_port = rtp_socket.local_addr().map(|a| a.port()).unwrap_or(0);
     let offer = sdp::build_offer(ctx.local_ip, rtp_port, now_unix() as u64);
@@ -184,9 +184,7 @@ async fn outgoing(
     let invite = match build_invite() {
         Ok(invite) => invite,
         Err(_) => {
-            return Finished::failed(
-                "Не удалось набрать этот номер. Проверьте, что он введён верно",
-            );
+            return Finished::failed(Notice::CannotDial);
         }
     };
 
@@ -198,7 +196,7 @@ async fn outgoing(
         tokio::select! {
             result = &mut invite_future => match result {
                 Ok(pair) => break pair,
-                Err(_) => return Finished::failed("Станция не отвечает. Проверьте подключение к сети"),
+                Err(_) => return Finished::failed(Notice::ServerNotResponding),
             },
             Some(state) = state_rx.recv() => {
                 if matches!(state, DialogState::Early(..)) {
@@ -206,7 +204,7 @@ async fn outgoing(
                 }
             }
             ctl = ctl_rx.recv() => match ctl {
-                // Если отбросить future, rsipstack сам отправит CANCEL.
+                // Dropping the future makes rsipstack send CANCEL itself.
                 Some(CallCtl::Hangup | CallCtl::Reject) | None => {
                     return Finished::without_talk(Outcome::Cancelled, None);
                 }
@@ -216,11 +214,11 @@ async fn outgoing(
     };
 
     let Some(response) = response else {
-        return Finished::failed("Станция не ответила на звонок");
+        return Finished::failed(Notice::NoAnswerFromServer);
     };
     if response.status_code.kind() != StatusCodeKind::Successful {
         let code = response.status_code.code();
-        return Finished::without_talk(Outcome::Failed, Some(describe_call_status(code)));
+        return Finished::without_talk(Outcome::Failed, Some(Notice::CallRejected(code)));
     }
 
     let result = match response_body(&response).and_then(|body| sdp::parse_remote(&body)) {
@@ -239,7 +237,7 @@ async fn outgoing(
         }
         Err(err) => {
             let _ = dialog.bye().await;
-            Finished::failed(format!("Не удалось договориться о звуке: {err}"))
+            Finished::failed(Notice::SoundNegotiationFailed(err))
         }
     };
     ctx.dialog_layer.remove_dialog(&dialog.id());
@@ -247,14 +245,14 @@ async fn outgoing(
 }
 
 fn response_body(response: &rsipstack::sip::Response) -> Result<String, String> {
-    String::from_utf8(response.body().to_vec()).map_err(|_| "ответ не в UTF-8".to_string())
+    String::from_utf8(response.body().to_vec()).map_err(|_| "the response is not UTF-8".to_string())
 }
 
-// ----------------------------------------------------------------- входящий
+// ----------------------------------------------------------------- incoming
 
 pub fn start_incoming(ctx: CallContext, tx: Transaction) {
     let Some((ctl_rx, guard)) = ctx.slot.claim() else {
-        // Уже разговариваем: звонящему — «занято».
+        // Already on a call: tell the caller we are busy.
         tokio::spawn(async move {
             let mut tx = tx;
             let _ = tx.reply(rsipstack::sip::StatusCode::BusyHere).await;
@@ -272,7 +270,7 @@ pub fn start_incoming(ctx: CallContext, tx: Transaction) {
 
 fn caller_of(request: &rsipstack::sip::Request) -> String {
     let Ok(from) = request.from_header().and_then(|h| h.typed()) else {
-        return "Неизвестный номер".to_string();
+        return UNKNOWN_PEER.to_string();
     };
     let number = from
         .uri
@@ -300,15 +298,13 @@ async fn incoming(
     use rsipstack::sip::StatusCode;
 
     let remote = match String::from_utf8(tx.original.body().to_vec())
-        .map_err(|_| "в запросе нет звука".to_string())
+        .map_err(|_| "the request has no audio offer".to_string())
         .and_then(|body| sdp::parse_remote(&body))
     {
         Ok(remote) => remote,
         Err(_) => {
             let _ = tx.reply(StatusCode::NotAcceptableHere).await;
-            return Finished::failed(format!(
-                "Не удалось принять звонок от {peer}: нет общего способа передачи звука"
-            ));
+            return Finished::failed(Notice::IncomingNoCommonAudio(peer.to_string()));
         }
     };
 
@@ -322,10 +318,10 @@ async fn incoming(
         Ok(dialog) => dialog,
         Err(_) => {
             let _ = tx.reply(StatusCode::ServerInternalError).await;
-            return Finished::failed("Не удалось принять входящий звонок");
+            return Finished::failed(Notice::IncomingFailed);
         }
     };
-    // Обработчик ждёт ACK или CANCEL от звонящего и двигает состояние диалога.
+    // The handler waits for the caller's ACK or CANCEL and moves the dialog state along.
     let mut handler_dialog = dialog.clone();
     tokio::spawn(async move {
         let _ = handler_dialog.handle(&mut tx).await;
@@ -333,7 +329,7 @@ async fn incoming(
     let _ = dialog.ringing(None, None);
 
     publish(ctx, peer, Phase::Incoming);
-    // Нет динамика или сигнал не запустился — звонок всё равно виден на экране.
+    // No speaker, or the tone failed to start: the call is still visible on screen.
     let ringtone = tokio::task::spawn_blocking(Ringtone::start)
         .await
         .ok()
@@ -368,18 +364,12 @@ async fn incoming(
         }
         Ok(Decision::CallerGaveUp) => {
             ctx.dialog_layer.remove_dialog(&dialog.id());
-            return Finished::without_talk(
-                Outcome::Missed,
-                Some(format!("Пропущенный звонок: {peer}")),
-            );
+            return Finished::without_talk(Outcome::Missed, Some(Notice::Missed(peer.to_string())));
         }
         Err(_) => {
             let _ = dialog.reject(Some(StatusCode::TemporarilyUnavailable), None);
             ctx.dialog_layer.remove_dialog(&dialog.id());
-            return Finished::without_talk(
-                Outcome::Missed,
-                Some(format!("Пропущенный звонок: {peer}")),
-            );
+            return Finished::without_talk(Outcome::Missed, Some(Notice::Missed(peer.to_string())));
         }
     }
 
@@ -388,7 +378,7 @@ async fn incoming(
         Err(err) => {
             let _ = dialog.reject(Some(StatusCode::ServerInternalError), None);
             ctx.dialog_layer.remove_dialog(&dialog.id());
-            return Finished::failed(audio_error_text(&err));
+            return Finished::failed(Notice::AudioUnavailable(err));
         }
     };
     let rtp_socket = match UdpSocket::bind("0.0.0.0:0").await {
@@ -396,7 +386,7 @@ async fn incoming(
         Err(err) => {
             let _ = dialog.reject(Some(StatusCode::ServerInternalError), None);
             ctx.dialog_layer.remove_dialog(&dialog.id());
-            return Finished::failed(format!("Не удалось подготовить звук: {err}"));
+            return Finished::failed(Notice::SoundSetupFailed(err.to_string()));
         }
     };
     let rtp_port = rtp_socket.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -415,7 +405,7 @@ async fn incoming(
         .is_err()
     {
         ctx.dialog_layer.remove_dialog(&dialog.id());
-        return Finished::failed("Не удалось ответить на звонок");
+        return Finished::failed(Notice::AnswerFailed);
     }
 
     let result = talk(
@@ -439,7 +429,7 @@ enum Decision {
     CallerGaveUp,
 }
 
-// ----------------------------------------------------------------- разговор
+// ----------------------------------------------------------------- conversation
 
 #[allow(clippy::too_many_arguments)]
 async fn talk(
@@ -487,7 +477,7 @@ async fn talk(
             },
             state = state_rx.recv() => match state {
                 Some(DialogState::Terminated(..)) | None => {
-                    break Some("Собеседник завершил разговор".to_string());
+                    break Some(Notice::PeerEndedCall);
                 }
                 Some(_) => {}
             },
@@ -496,18 +486,15 @@ async fn talk(
 
     stop.cancel();
     let stats = media_task.await.unwrap_or_default();
-    // Если за заметное время не пришло ни одного пакета звука, скорее всего его блокирует сеть.
+    // If no audio packet arrived for a noticeable time, the network is most likely blocking it.
     let silent = stats.received == 0 && connected_at.elapsed() > Duration::from_secs(5);
-    let message = match (message, silent) {
-        (_, true) => Some(
-            "Собеседника не было слышно: звук от него не приходил. Возможно, мешают настройки сети"
-                .to_string(),
-        ),
+    let notice = match (message, silent) {
+        (_, true) => Some(Notice::NoAudioReceived),
         (message, false) => message,
     };
     Finished {
         outcome: Outcome::Completed,
-        message,
+        notice,
         connected_at: Some(connected_at),
     }
 }
@@ -518,10 +505,4 @@ fn credential(account: &Account) -> Credential {
         password: account.password.clone(),
         realm: None,
     }
-}
-
-fn audio_error_text(err: &str) -> String {
-    format!(
-        "Нет доступа к микрофону или динамику. Разрешите доступ в настройках системы и попробуйте снова ({err})"
-    )
 }

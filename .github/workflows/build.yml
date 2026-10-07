@@ -1,4 +1,4 @@
-name: Сборка
+name: Build
 
 on:
   push:
@@ -34,50 +34,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Сторонние действия закреплены по хэшу коммита, а не по подвижному тегу.
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # ветка stable
+      # Third-party actions are pinned to a commit hash, not to a movable tag.
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Системные пакеты (Linux)
+      - name: System packages (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libasound2-dev libxkbcommon-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev libssl-dev
 
-      - name: Тесты
+      - name: Tests
         run: cargo test
 
-      # ---------- macOS: универсальное приложение (Apple Silicon + Intel) в .dmg
-      - name: Сборка .app и .dmg
+      # ---------- macOS: universal app (Apple Silicon + Intel) in a .dmg
+      - name: Build .app and .dmg
         if: runner.os == 'macOS'
         run: ./scripts/bundle-macos.sh --universal --dmg
 
-      - name: Упаковка (macOS)
+      - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
           mkdir -p out
           cp dist/*.dmg out/
 
-      # ---------- Windows: .exe с иконкой в zip
-      - name: Сборка (Windows)
+      # ---------- Windows: .exe with icon in a zip
+      - name: Build (Windows)
         if: runner.os == 'Windows'
         run: cargo build --release
 
-      - name: Упаковка (Windows)
+      - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
           Compress-Archive -Path target/release/rust_sip_phone.exe -DestinationPath out/RustSIPPhone-windows.zip
 
-      # ---------- Linux: бинарник + ярлык + иконка в tar.gz
-      - name: Сборка (Linux)
+      # ---------- Linux: binary + desktop entry + icon in a tar.gz
+      - name: Build (Linux)
         if: runner.os == 'Linux'
         run: cargo build --release
 
-      - name: Упаковка (Linux)
+      - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p out stage/RustSIPPhone
@@ -93,7 +93,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Релиз
+    name: Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04

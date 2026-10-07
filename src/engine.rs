@@ -1,4 +1,4 @@
-//! Ядро телефона: держит SIP-регистрацию, принимает команды интерфейса и запускает звонки.
+//! Phone core: keeps the SIP registration, takes commands from the interface and starts calls.
 
 use crate::call::{self, CallContext, CallCtl, CallSlot};
 use crate::model::*;
@@ -14,7 +14,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Как часто обновляем регистрацию (срок жизни — 60 с).
+/// How often the registration is refreshed (its lifetime is 60 s).
 const REFRESH_EVERY: Duration = Duration::from_secs(40);
 const RETRY_AFTER: Duration = Duration::from_secs(15);
 
@@ -31,8 +31,8 @@ pub async fn run(mut commands: UnboundedReceiver<Command>, events: Events) {
                 events.send(Event::Reg(RegState::Connecting));
                 match Session::start(account, events.clone(), slot.clone()).await {
                     Ok(new) => session = Some(new),
-                    Err(message) => events.send(Event::Reg(RegState::Failed {
-                        message,
+                    Err(notice) => events.send(Event::Reg(RegState::Failed {
+                        notice,
                         retry: false,
                     })),
                 }
@@ -50,7 +50,7 @@ pub async fn run(mut commands: UnboundedReceiver<Command>, events: Events) {
                         events.send(Event::Toast(message));
                     }
                 }
-                None => events.send(Event::Toast("Сначала войдите в аккаунт".into())),
+                None => events.send(Event::Toast(Notice::SignInFirst)),
             },
             Command::Answer => slot.send(CallCtl::Answer),
             Command::Reject => slot.send(CallCtl::Reject),
@@ -61,7 +61,7 @@ pub async fn run(mut commands: UnboundedReceiver<Command>, events: Events) {
         }
     }
 
-    // Выходим: завершаем звонок и снимаем регистрацию, чтобы станция не считала нас онлайн.
+    // Shutting down: end the call and unregister so the station does not think we are online.
     slot.send(CallCtl::Hangup);
     for _ in 0..30 {
         if !slot.is_busy() {
@@ -87,17 +87,17 @@ impl Session {
         account: Account,
         events: Events,
         slot: Arc<CallSlot>,
-    ) -> Result<Session, String> {
+    ) -> Result<Session, Notice> {
         let server_addr = net::resolve(&account.server)
             .await
-            .map_err(|_| "Не удалось найти станцию по этому адресу. Проверьте, как он написан")?;
-        let local_ip = net::local_ip_towards(server_addr).map_err(|_| "Нет подключения к сети")?;
+            .map_err(|_| Notice::ServerNotFound)?;
+        let local_ip = net::local_ip_towards(server_addr).map_err(|_| Notice::NoNetwork)?;
         let account = Arc::new(account);
 
         let cancel = CancellationToken::new();
         let endpoint = create_endpoint(local_ip, cancel.clone())
             .await
-            .map_err(|e| format!("Не удалось запустить телефон: {e}"))?;
+            .map_err(|e| Notice::PhoneStartFailed(e.to_string()))?;
         let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
         let ctx = CallContext {
             dialog_layer,
@@ -117,7 +117,7 @@ impl Session {
         let incoming = tokio::spawn(incoming_loop(
             endpoint
                 .incoming_transactions()
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| Notice::PhoneStartFailed(e.to_string()))?,
             ctx.clone(),
         ));
         let registration = tokio::spawn(registration_loop(
@@ -141,7 +141,7 @@ impl Session {
     }
 
     async fn stop(self) {
-        // Сначала даём регистрации снять себя со станции, потом гасим сам стек.
+        // First let the registration remove itself from the station, then shut the stack down.
         self.cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(4), self.registration).await;
         self.endpoint.shutdown();
@@ -155,7 +155,7 @@ async fn create_endpoint(
     local_ip: std::net::IpAddr,
     cancel: CancellationToken,
 ) -> rsipstack::Result<Endpoint> {
-    // Привязываемся к конкретному адресу, чтобы Via/Contact указывали на тот интерфейс, что видит станция.
+    // Bind to a specific address so Via/Contact name the interface the station can see.
     let local_address = std::net::SocketAddr::new(local_ip, 0);
     let transport_layer = rsipstack::transport::TransportLayer::new(cancel.clone());
     let udp = rsipstack::transport::udp::UdpConnection::create_connection(
@@ -181,7 +181,7 @@ async fn registration_loop(
 ) {
     let Ok(target) = format!("sip:{}", account.server).parse::<rsipstack::sip::Uri>() else {
         events.send(Event::Reg(RegState::Failed {
-            message: "Адрес станции записан неверно".into(),
+            notice: Notice::ServerAddressInvalid,
             retry: false,
         }));
         return;
@@ -210,10 +210,10 @@ async fn registration_loop(
             Ok(response) => {
                 let code = response.status_code().code();
                 let credentials_rejected = matches!(code, 401 | 403 | 404 | 407);
-                // Неверный пароль не лечится повторами — ждём, пока человек поправит данные.
+                // A wrong password is not fixed by retrying: wait until the user corrects the details.
                 let retry = ever_online || !credentials_rejected;
                 events.send(Event::Reg(RegState::Failed {
-                    message: describe_register_status(code),
+                    notice: Notice::RegistrationRejected(code),
                     retry,
                 }));
                 if !retry {
@@ -223,7 +223,7 @@ async fn registration_loop(
             }
             Err(_) => {
                 events.send(Event::Reg(RegState::Failed {
-                    message: "Станция не отвечает. Пробуем снова".into(),
+                    notice: Notice::RegistrationRetrying,
                     retry: true,
                 }));
                 RETRY_AFTER
@@ -249,7 +249,7 @@ async fn incoming_loop(
     ctx: CallContext,
 ) {
     while let Some(mut transaction) = incoming.recv().await {
-        // Запросы внутри диалога (BYE от собеседника и т.п.) отдаём самому диалогу.
+        // Requests inside a dialog (BYE from the other side etc.) go to the dialog itself.
         if let Some(mut dialog) = ctx.dialog_layer.match_dialog(&transaction) {
             let _ = dialog.handle(&mut transaction).await;
             continue;

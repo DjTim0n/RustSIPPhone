@@ -1,4 +1,4 @@
-//! RTP-сессия: микрофон -> G.711 -> UDP и UDP -> G.711 -> динамик, плюс DTMF (RFC 4733).
+//! RTP session: microphone -> G.711 -> UDP and UDP -> G.711 -> speaker, plus DTMF (RFC 4733).
 
 use crate::audio::{AudioIo, SpeakerQueue};
 use crate::g711::Codec;
@@ -12,9 +12,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-/// 20 мс при 8 кГц.
+/// 20 ms at 8 kHz.
 const FRAME_SAMPLES: usize = 160;
-/// Сколько 20-мс пакетов занимает одна цифра (200 мс); последние три — с флагом конца.
+/// How many 20 ms packets one digit takes (200 ms); the last three carry the end flag.
 const DTMF_PACKETS: u16 = 10;
 const DTMF_END_PACKETS: u16 = 3;
 
@@ -23,13 +23,13 @@ pub struct MediaStats {
     pub received: u64,
 }
 
-/// То, чем ядро управляет разговором во время звонка.
+/// What the core uses to steer a call while it is in progress.
 pub struct MediaControl {
     pub muted: Arc<AtomicBool>,
     pub dtmf: mpsc::UnboundedReceiver<char>,
 }
 
-/// Крутит медиа, пока не сработает `stop`. Владеет аудиоустройствами: после выхода они закрыты.
+/// Runs media until `stop` fires. Owns the audio devices: they are closed when this returns.
 pub async fn run(
     socket: Arc<UdpSocket>,
     remote: Remote,
@@ -38,7 +38,7 @@ pub async fn run(
     signalling_ip: IpAddr,
     stop: CancellationToken,
 ) -> MediaStats {
-    // Звук, накопленный за время дозвона, не нужен.
+    // Audio captured while dialling is not needed.
     while audio.mic.try_recv().is_ok() {}
 
     let (remote_tx, remote_rx) = watch::channel(remote.addr);
@@ -129,7 +129,7 @@ async fn send_loop(
             }
 
             let (header, payload) = match (&mut dtmf, dtmf_pt) {
-                // Пока идёт цифра, вместо звука шлём пакеты события.
+                // While a digit is being sent, event packets replace the audio.
                 (Some(state), Some(pt)) => {
                     let n = state.packets_sent;
                     let end = n + DTMF_END_PACKETS >= DTMF_PACKETS;
@@ -150,7 +150,7 @@ async fn send_loop(
                     state.packets_sent += 1;
                     if state.packets_sent >= DTMF_PACKETS {
                         dtmf = None;
-                        marker = true; // после события звук начинается «заново»
+                        marker = true; // audio starts "afresh" after the event
                     }
                     (header, payload)
                 }

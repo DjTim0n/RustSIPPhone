@@ -27,9 +27,8 @@ Sign in to your PBX, dial a number, answer calls — on macOS, Windows and Linux
 - **Recent calls** — incoming, outgoing and missed, one click to call back.
 - **In-call controls** — mute, keypad tones (DTMF) for voice menus, hang up.
 - **Ringtone** that plays on every platform, with nothing extra to install.
+- **Two interface languages:** **English** (the default) and **Russian**. Switch at any time from the sign-in screen or from the top bar; the choice is remembered.
 - **Single small binary.** No runtime, no installer required.
-
-> The interface is currently in Russian.
 
 ## 📦 Download
 
@@ -90,10 +89,11 @@ No keyring service? The phone still works; it just asks for the password each ti
 
 ### First launch
 
-1. Enter the **station address** (your PBX, for example `192.168.1.10:5060`; the port defaults to `5060`), your **extension** and your **password** — your administrator or provider gives you these.
-2. Press **Войти** (Sign in). When the dot in the top-left turns green and says **На связи** (Online), you are registered.
-3. Type or tap a number and press **Позвонить** (Call).
-4. Incoming calls open an **Ответить / Отклонить** (Answer / Decline) screen and ring.
+1. Pick your language in the top-right corner if you want something other than English.
+2. Enter the **station address** (your PBX, for example `192.168.1.10:5060`; the port defaults to `5060`), your **extension number** and your **password** — your administrator or provider gives you these.
+3. Press **Sign in**. When the dot in the top-left turns green and says **Online**, you are registered.
+4. Type or tap a number and press **Call**.
+5. Incoming calls ring and open an **Answer / Decline** screen.
 
 ## ✅ Verify your download
 
@@ -127,11 +127,11 @@ codesign -dv /Applications/RustSIPPhone.app 2>&1 | grep -E "Identifier|Signature
 
 | Step | Expected result |
 | --- | --- |
-| Sign in with your account | Green dot and **На связи** |
-| Call a second extension | **Идёт вызов…**, then a timer when answered |
+| Sign in with your account | Green dot and **Online** |
+| Call a second extension | **Ringing…**, then a timer when answered |
 | Call an echo-test number (on Asterisk usually `*43` or `600`) | You hear yourself, both directions work |
 | Call the phone from another extension | Ringtone and the answer screen |
-| Press **Клавиши** during a call and dial a digit | Voice menus react to the tone |
+| Press **Keypad** during a call and dial a digit | Voice menus react to the tone |
 
 If a call connects but you hear nothing, the app tells you when no audio arrived from the other side — that usually points to a NAT or firewall problem (see [Notes](#-notes-and-limitations)).
 
@@ -187,7 +187,8 @@ Releases are built by [GitHub Actions](.github/workflows/build.yml) on macOS, Wi
 
 | Module | Role |
 | --- | --- |
-| [`ui.rs`](src/ui.rs) | Desktop interface (egui): sign-in, dialer, recent calls, call screen |
+| [`ui.rs`](src/ui.rs) | Desktop interface (egui): sign-in, dialer, recent calls, call screen, language switch |
+| [`i18n.rs`](src/i18n.rs) | Interface languages and the text of every message the core reports |
 | [`engine.rs`](src/engine.rs) | SIP registration, incoming-request routing, command handling |
 | [`call.rs`](src/call.rs) | Outgoing and incoming calls, call state |
 | [`media.rs`](src/media.rs) | RTP send/receive, DTMF, protection against stray audio packets |
@@ -197,7 +198,7 @@ Releases are built by [GitHub Actions](.github/workflows/build.yml) on macOS, Wi
 
 The SIP signalling is handled by [`rsipstack`](https://crates.io/crates/rsipstack).
 
-Your account lives in:
+Your account, call history and language choice live in:
 
 | System | Settings and history | Password |
 | --- | --- | --- |
@@ -218,6 +219,8 @@ Your account lives in:
 ## 🤝 Contributing
 
 Issues and pull requests are welcome. Please run `cargo test` before sending a change and keep the code formatted with `cargo fmt`.
+
+**Adding a language:** add a variant to `Lang` in [`i18n.rs`](src/i18n.rs), then supply its text where `Lang::t` is used (the interface in [`ui.rs`](src/ui.rs) and the messages in [`i18n.rs`](src/i18n.rs)). A test checks that every message exists in every language.
 
 ## 📄 License
 

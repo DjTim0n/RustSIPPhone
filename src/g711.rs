@@ -1,4 +1,4 @@
-//! Кодеки G.711: PCMU (μ-law, payload type 0) и PCMA (A-law, payload type 8).
+//! G.711 codecs: PCMU (μ-law, payload type 0) and PCMA (A-law, payload type 8).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {

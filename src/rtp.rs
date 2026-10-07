@@ -1,4 +1,4 @@
-//! Минимальная реализация RTP-пакета (RFC 3550): заголовок 12 байт + payload.
+//! Minimal RTP packet implementation (RFC 3550): 12-byte header + payload.
 
 pub const RTP_VERSION: u8 = 2;
 const HEADER_LEN: usize = 12;
@@ -23,8 +23,8 @@ pub fn build_packet(header: &RtpHeader, payload: &[u8]) -> Vec<u8> {
     packet
 }
 
-/// Разбирает пакет. Учитывает CSRC, расширение и padding.
-/// Возвращает `None`, если это не RTP версии 2 или пакет обрезан.
+/// Parses a packet. Handles CSRC, header extension and padding.
+/// Returns `None` if this is not RTP version 2 or the packet is truncated.
 pub fn parse_packet(buf: &[u8]) -> Option<(RtpHeader, &[u8])> {
     if buf.len() < HEADER_LEN || buf[0] >> 6 != RTP_VERSION {
         return None;
@@ -87,8 +87,8 @@ mod tests {
     #[test]
     fn skips_csrc_and_extension() {
         let mut packet = vec![RTP_VERSION << 6 | 0x10 | 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1];
-        packet.extend_from_slice(&[0, 0, 0, 7]); // один CSRC
-        packet.extend_from_slice(&[0xBE, 0xDE, 0, 1, 9, 9, 9, 9]); // расширение в 1 слово
+        packet.extend_from_slice(&[0, 0, 0, 7]); // one CSRC
+        packet.extend_from_slice(&[0xBE, 0xDE, 0, 1, 9, 9, 9, 9]); // extension of 1 word
         packet.extend_from_slice(&[42, 43]);
         let (_, payload) = parse_packet(&packet).unwrap();
         assert_eq!(payload, &[42, 43]);

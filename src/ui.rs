@@ -1,5 +1,6 @@
-//! Интерфейс телефона на egui.
+//! The phone's interface, built with egui.
 
+use crate::i18n::Lang;
 use crate::model::*;
 use crate::store::{self, Stored};
 use eframe::egui::{
@@ -10,7 +11,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
-// Палитра: тёмная, один акцентный синий, зелёный и красный — только для звонка и отбоя.
+// Palette: dark, one blue accent; green and red are reserved for answering and hanging up.
 const BG: Color32 = Color32::from_rgb(0x12, 0x15, 0x1A);
 const SURFACE: Color32 = Color32::from_rgb(0x1B, 0x20, 0x27);
 const SURFACE_HI: Color32 = Color32::from_rgb(0x26, 0x2D, 0x37);
@@ -24,6 +25,8 @@ const AMBER: Color32 = Color32::from_rgb(0xE0, 0xA0, 0x30);
 const COLUMN_WIDTH: f32 = 340.0;
 const DIAL_KEYS: [&str; 12] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"];
 const TOAST_LIFETIME: Duration = Duration::from_secs(10);
+const LANG_SWITCH_WIDE: f32 = 176.0;
+const LANG_SWITCH_COMPACT: f32 = 76.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -36,18 +39,18 @@ struct LoginForm {
     server: String,
     extension: String,
     password: String,
-    error: Option<String>,
+    error: Option<Notice>,
 }
 
 pub struct PhoneApp {
-    // Рантайм живёт столько же, сколько приложение: на нём работает ядро.
+    // The runtime lives as long as the app: the core runs on it.
     runtime: tokio::runtime::Runtime,
     engine: Option<tokio::task::JoinHandle<()>>,
     commands: UnboundedSender<Command>,
     events: Receiver<Event>,
 
     stored: Stored,
-    /// Мы хотим быть «в сети»: показываем телефон, а не форму входа.
+    /// We want to be online: show the phone, not the sign-in form.
     signed_in: bool,
     reg: RegState,
     form: LoginForm,
@@ -57,14 +60,14 @@ pub struct PhoneApp {
     call: Option<CallView>,
     muted: bool,
     keypad_open: bool,
-    toast: Option<(String, Instant)>,
+    toast: Option<(Notice, Instant)>,
 }
 
 impl PhoneApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_style(&cc.egui_ctx);
 
-        let runtime = tokio::runtime::Runtime::new().expect("не удалось запустить рантайм");
+        let runtime = tokio::runtime::Runtime::new().expect("could not start the async runtime");
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let repaint_ctx = cc.egui_ctx.clone();
@@ -99,7 +102,7 @@ impl PhoneApp {
         app
     }
 
-    /// Если аккаунт уже сохранён вместе с паролем — входим без вопросов.
+    /// If the account is already stored together with its password, sign in without asking.
     fn try_auto_login(&mut self) {
         if self.stored.server.is_empty() || self.stored.extension.is_empty() {
             return;
@@ -130,8 +133,8 @@ impl PhoneApp {
             extension: self.form.extension.trim().to_string(),
             password: self.form.password.clone(),
         };
-        // Нет хранилища паролей (например, на Linux без gnome-keyring) — это не повод не пускать:
-        // входим, но честно предупреждаем, что пароль придётся вводить заново.
+        // No password store (for example Linux without gnome-keyring) is no reason to refuse:
+        // sign in, but honestly warn that the password will have to be typed again.
         let password_saved = store::save_password(&account).is_ok();
         self.stored.server = account.server.clone();
         self.stored.extension = account.extension.clone();
@@ -141,10 +144,7 @@ impl PhoneApp {
         self.reg = RegState::Connecting;
         self.send(Command::Register(account));
         if !password_saved {
-            self.show_toast(
-                "Пароль не сохранён: в системе нет хранилища паролей. В следующий раз его придётся ввести заново"
-                    .into(),
-            );
+            self.show_toast(Notice::PasswordNotSaved);
         }
     }
 
@@ -170,13 +170,13 @@ impl PhoneApp {
             match event {
                 Event::Reg(state) => {
                     if let RegState::Failed {
-                        message,
+                        notice,
                         retry: false,
                     } = &state
                     {
-                        // Станция не приняла данные: возвращаем человека к форме.
+                        // The station rejected the details: take the user back to the form.
                         self.signed_in = false;
-                        self.form.error = Some(message.clone());
+                        self.form.error = Some(notice.clone());
                     }
                     self.reg = state;
                 }
@@ -187,20 +187,31 @@ impl PhoneApp {
                     }
                     self.call = view;
                 }
-                Event::CallEnded { entry, message } => {
+                Event::CallEnded { entry, notice } => {
                     store::push_history(&mut self.stored, entry);
                     store::save(&self.stored);
-                    if let Some(message) = message {
-                        self.show_toast(message);
+                    if let Some(notice) = notice {
+                        self.show_toast(notice);
                     }
                 }
-                Event::Toast(message) => self.show_toast(message),
+                Event::Toast(notice) => self.show_toast(notice),
             }
         }
     }
 
-    fn show_toast(&mut self, message: String) {
-        self.toast = Some((message, Instant::now()));
+    fn show_toast(&mut self, notice: Notice) {
+        self.toast = Some((notice, Instant::now()));
+    }
+
+    fn lang(&self) -> Lang {
+        self.stored.language
+    }
+
+    fn set_language(&mut self, lang: Lang) {
+        if self.stored.language != lang {
+            self.stored.language = lang;
+            store::save(&self.stored);
+        }
     }
 }
 
@@ -209,7 +220,7 @@ impl eframe::App for PhoneApp {
         self.drain_events();
         let ctx = ui.ctx().clone();
 
-        // Во время разговора цифры с клавиатуры уходят собеседнику как тоны.
+        // During a call, digits typed on the keyboard go to the other side as tones.
         if self.call.as_ref().is_some_and(|c| c.phase == Phase::Active) {
             let typed: Vec<char> = ctx.input(|i| {
                 i.events
@@ -225,7 +236,7 @@ impl eframe::App for PhoneApp {
             for digit in typed {
                 self.send(Command::Dtmf(digit));
             }
-            ctx.request_repaint_after(Duration::from_millis(500)); // секундомер
+            ctx.request_repaint_after(Duration::from_millis(500)); // call timer
         }
         if let Some((_, since)) = &self.toast {
             if since.elapsed() > TOAST_LIFETIME {
@@ -261,7 +272,7 @@ impl eframe::App for PhoneApp {
     }
 
     fn on_exit(&mut self) {
-        // Просим ядро положить трубку и снять регистрацию, и ждём его недолго.
+        // Ask the core to hang up and unregister, and wait for it briefly.
         self.send(Command::Shutdown);
         if let Some(engine) = self.engine.take() {
             let _ = self
@@ -271,45 +282,68 @@ impl eframe::App for PhoneApp {
     }
 }
 
-// ------------------------------------------------------------------ вход
+// ------------------------------------------------------------------ sign in
 
 impl PhoneApp {
     fn login_screen(&mut self, ui: &mut Ui) {
-        ui.add_space(36.0);
+        let l = self.lang();
+        let switch_row = ui.allocate_space(vec2(ui.available_width(), 32.0)).1;
+        let switch_rect = Rect::from_min_size(
+            pos2(switch_row.right() - LANG_SWITCH_WIDE, switch_row.top()),
+            vec2(LANG_SWITCH_WIDE, switch_row.height()),
+        );
+        if let Some(chosen) = language_switch(ui, switch_rect, l, false) {
+            self.set_language(chosen);
+        }
+        let l = self.lang();
+
+        ui.add_space(24.0);
         ui.label(
-            RichText::new("Вход в телефон")
+            RichText::new(l.t("Sign in to your phone", "Вход в телефон"))
                 .size(26.0)
                 .strong()
                 .color(TEXT),
         );
         ui.add_space(6.0);
         ui.label(
-            RichText::new("Введите данные, которые выдал администратор")
-                .size(14.0)
-                .color(MUTED),
+            RichText::new(l.t(
+                "Enter the details your administrator gave you",
+                "Введите данные, которые выдал администратор",
+            ))
+            .size(14.0)
+            .color(MUTED),
         );
         ui.add_space(28.0);
 
         let connecting = matches!(self.reg, RegState::Connecting) && self.signed_in;
         field(
             ui,
-            "Адрес станции",
-            "например, 192.168.1.10:5060",
+            l.t("Station address", "Адрес станции"),
+            l.t(
+                "for example, 192.168.1.10:5060",
+                "например, 192.168.1.10:5060",
+            ),
             &mut self.form.server,
             false,
         );
         field(
             ui,
-            "Внутренний номер",
-            "например, 300",
+            l.t("Extension number", "Внутренний номер"),
+            l.t("for example, 300", "например, 300"),
             &mut self.form.extension,
             false,
         );
-        let password_response = field(ui, "Пароль", "", &mut self.form.password, true);
+        let password_response = field(
+            ui,
+            l.t("Password", "Пароль"),
+            "",
+            &mut self.form.password,
+            true,
+        );
 
         if let Some(error) = &self.form.error {
             ui.add_space(4.0);
-            ui.label(RichText::new(error).size(13.5).color(RED));
+            ui.label(RichText::new(error.text(l)).size(13.5).color(RED));
         }
         ui.add_space(20.0);
 
@@ -318,9 +352,9 @@ impl PhoneApp {
             && !self.form.password.is_empty();
         let enter = password_response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         let label = if connecting {
-            "Подключаемся…"
+            l.t("Connecting…", "Подключаемся…")
         } else {
-            "Войти"
+            l.t("Sign in", "Войти")
         };
         if pill(
             ui,
@@ -358,7 +392,7 @@ fn field(
     response
 }
 
-// --------------------------------------------------------------- телефон
+// --------------------------------------------------------------- phone
 
 impl PhoneApp {
     fn phone_screen(&mut self, ui: &mut Ui) {
@@ -374,18 +408,20 @@ impl PhoneApp {
     }
 
     fn header(&mut self, ui: &mut Ui) {
+        let l = self.lang();
         let (dot, status) = match &self.reg {
-            RegState::Online => (GREEN, "На связи".to_string()),
-            RegState::Connecting => (AMBER, "Подключаемся…".to_string()),
-            RegState::Failed { message, retry } => (
+            RegState::Online => (GREEN, l.t("Online", "На связи").to_string()),
+            RegState::Connecting => (AMBER, l.t("Connecting…", "Подключаемся…").to_string()),
+            RegState::Failed { notice, retry } => (
                 RED,
                 if *retry {
-                    "Нет связи, пробуем снова…".to_string()
+                    l.t("No connection, trying again…", "Нет связи, пробуем снова…")
+                        .to_string()
                 } else {
-                    message.clone()
+                    notice.text(l)
                 },
             ),
-            RegState::Offline => (MUTED, "Не подключено".to_string()),
+            RegState::Offline => (MUTED, l.t("Not connected", "Не подключено").to_string()),
         };
         let rect = ui.allocate_space(vec2(ui.available_width(), 44.0)).1;
         let painter = ui.painter();
@@ -393,7 +429,7 @@ impl PhoneApp {
         painter.text(
             pos2(rect.left() + 20.0, rect.center().y - 9.0),
             Align2::LEFT_CENTER,
-            format!("Номер {}", self.stored.extension),
+            format!("{} {}", l.t("Extension", "Номер"), self.stored.extension),
             FontId::proportional(15.0),
             TEXT,
         );
@@ -417,26 +453,37 @@ impl PhoneApp {
         ui.painter().text(
             exit_rect.center(),
             Align2::CENTER_CENTER,
-            "Выйти",
+            l.t("Sign out", "Выйти"),
             FontId::proportional(13.5),
             MUTED,
         );
         if response.clicked() {
             self.sign_out();
         }
+        let switch_rect = Rect::from_center_size(
+            pos2(
+                exit_rect.left() - 10.0 - LANG_SWITCH_COMPACT / 2.0,
+                rect.center().y,
+            ),
+            vec2(LANG_SWITCH_COMPACT, 32.0),
+        );
+        if let Some(chosen) = language_switch(ui, switch_rect, l, true) {
+            self.set_language(chosen);
+        }
     }
 
     fn toast_banner(&mut self, ui: &mut Ui) {
-        let Some((message, _)) = &self.toast else {
+        let Some((notice, _)) = &self.toast else {
             return;
         };
+        let message = notice.text(self.stored.language);
         egui::Frame::new()
             .fill(SURFACE_HI)
             .corner_radius(CornerRadius::same(10))
             .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new(message).size(13.5).color(TEXT));
+                ui.label(RichText::new(&message).size(13.5).color(TEXT));
             });
         ui.add_space(10.0);
     }
@@ -446,9 +493,13 @@ impl PhoneApp {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(20), SURFACE);
         let half = rect.width() / 2.0;
-        for (i, (tab, label)) in [(Tab::Dial, "Набор"), (Tab::Recent, "Недавние")]
-            .into_iter()
-            .enumerate()
+        let l = self.lang();
+        for (i, (tab, label)) in [
+            (Tab::Dial, l.t("Dial", "Набор")),
+            (Tab::Recent, l.t("Recent", "Недавние")),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let tab_rect = Rect::from_min_size(
                 pos2(rect.left() + half * i as f32, rect.top()),
@@ -475,13 +526,14 @@ impl PhoneApp {
     }
 
     fn dial_tab(&mut self, ui: &mut Ui) {
+        let l = self.lang();
         ui.add_space(10.0);
         let display = ui.add(
             TextEdit::singleline(&mut self.number)
                 .font(FontId::proportional(34.0))
                 .horizontal_align(Align::Center)
                 .hint_text(
-                    RichText::new("Введите номер")
+                    RichText::new(l.t("Enter a number", "Введите номер"))
                         .size(22.0)
                         .color(MUTED.gamma_multiply(0.6)),
                 )
@@ -493,7 +545,7 @@ impl PhoneApp {
         display.request_focus();
         let enter = display.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
 
-        // Стереть — маленькая кнопка под номером; пока номера нет, место просто пустое.
+        // Erase is a small button under the number; while there is no number the space stays empty.
         let erase_row = ui.allocate_space(vec2(ui.available_width(), 26.0)).1;
         if !self.number.is_empty() {
             let rect = Rect::from_center_size(erase_row.center(), vec2(90.0, 24.0));
@@ -501,7 +553,7 @@ impl PhoneApp {
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                "Стереть",
+                l.t("Erase", "Стереть"),
                 FontId::proportional(13.5),
                 if response.hovered() { TEXT } else { MUTED },
             );
@@ -517,7 +569,14 @@ impl PhoneApp {
         ui.add_space(14.0);
 
         let can_call = !self.number.trim().is_empty() && matches!(self.reg, RegState::Online);
-        let clicked = pill(ui, 54.0, GREEN, "Позвонить", Color32::WHITE, can_call);
+        let clicked = pill(
+            ui,
+            54.0,
+            GREEN,
+            l.t("Call", "Позвонить"),
+            Color32::WHITE,
+            can_call,
+        );
         if (clicked || enter) && can_call {
             let number = self.number.clone();
             self.start_call(&number);
@@ -526,22 +585,30 @@ impl PhoneApp {
             ui.add_space(6.0);
             ui.vertical_centered(|ui| {
                 ui.label(
-                    RichText::new("Звонить можно, когда телефон на связи")
-                        .size(12.5)
-                        .color(MUTED),
+                    RichText::new(l.t(
+                        "You can call once the phone is online",
+                        "Звонить можно, когда телефон на связи",
+                    ))
+                    .size(12.5)
+                    .color(MUTED),
                 );
             });
         }
     }
 
     fn recent_tab(&mut self, ui: &mut Ui) {
+        let l = self.lang();
         if self.stored.history.is_empty() {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Звонков пока не было").size(16.0).color(TEXT));
+                ui.label(
+                    RichText::new(l.t("No calls yet", "Звонков пока не было"))
+                        .size(16.0)
+                        .color(TEXT),
+                );
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new("Здесь появятся ваши звонки")
+                    RichText::new(l.t("Your calls will appear here", "Здесь появятся ваши звонки"))
                         .size(13.5)
                         .color(MUTED),
                 );
@@ -559,13 +626,13 @@ impl PhoneApp {
                         ui.painter()
                             .rect_filled(rect, CornerRadius::same(10), SURFACE);
                     }
-                    let (color, kind) = history_kind(entry);
+                    let (color, kind) = history_kind(entry, l);
                     let painter = ui.painter();
                     painter.circle_filled(pos2(rect.left() + 14.0, rect.center().y), 5.0, color);
                     painter.text(
                         pos2(rect.left() + 32.0, rect.center().y - 10.0),
                         Align2::LEFT_CENTER,
-                        &entry.number,
+                        peer_label(&entry.number, l),
                         FontId::proportional(16.0),
                         if entry.outcome == Outcome::Missed {
                             RED
@@ -576,7 +643,7 @@ impl PhoneApp {
                     painter.text(
                         pos2(rect.left() + 32.0, rect.center().y + 11.0),
                         Align2::LEFT_CENTER,
-                        format!("{kind} · {}", format_time(entry.started_at)),
+                        format!("{kind} · {}", format_time(entry.started_at, l)),
                         FontId::proportional(12.5),
                         MUTED,
                     );
@@ -584,7 +651,7 @@ impl PhoneApp {
                         painter.text(
                             pos2(rect.right() - 8.0, rect.center().y),
                             Align2::RIGHT_CENTER,
-                            format_duration(entry.duration_secs),
+                            format_duration(entry.duration_secs, l),
                             FontId::proportional(13.0),
                             MUTED,
                         );
@@ -594,8 +661,8 @@ impl PhoneApp {
                     }
                 }
             });
-        if let Some(number) = chosen {
-            // В журнале номер может быть с именем: «Имя (300)» — для набора берём то, что в скобках.
+        if let Some(number) = chosen.filter(|n| n != UNKNOWN_PEER) {
+            // A history entry may hold a name with the number, "Name (300)": dial the part in brackets.
             let dialable = match (number.rfind('('), number.rfind(')')) {
                 (Some(a), Some(b)) if a < b => number[a + 1..b].to_string(),
                 _ => number,
@@ -606,18 +673,27 @@ impl PhoneApp {
     }
 }
 
-fn history_kind(entry: &HistoryEntry) -> (Color32, &'static str) {
+fn history_kind(entry: &HistoryEntry, l: Lang) -> (Color32, &'static str) {
     match (entry.direction, entry.outcome) {
-        (Direction::Incoming, Outcome::Missed) => (RED, "Пропущенный"),
-        (Direction::Incoming, Outcome::Declined) => (MUTED, "Отклонённый"),
-        (Direction::Incoming, _) => (ACCENT, "Входящий"),
-        (Direction::Outgoing, Outcome::Failed) => (MUTED, "Не дозвонились"),
-        (Direction::Outgoing, Outcome::Cancelled) => (MUTED, "Отменённый"),
-        (Direction::Outgoing, _) => (GREEN, "Исходящий"),
+        (Direction::Incoming, Outcome::Missed) => (RED, l.t("Missed", "Пропущенный")),
+        (Direction::Incoming, Outcome::Declined) => (MUTED, l.t("Declined", "Отклонённый")),
+        (Direction::Incoming, _) => (ACCENT, l.t("Incoming", "Входящий")),
+        (Direction::Outgoing, Outcome::Failed) => (MUTED, l.t("No answer", "Не дозвонились")),
+        (Direction::Outgoing, Outcome::Cancelled) => (MUTED, l.t("Cancelled", "Отменённый")),
+        (Direction::Outgoing, _) => (GREEN, l.t("Outgoing", "Исходящий")),
     }
 }
 
-fn format_time(unix: i64) -> String {
+/// The caller's number, or a localized placeholder when the caller was unknown.
+fn peer_label(peer: &str, l: Lang) -> &str {
+    if peer == UNKNOWN_PEER {
+        l.t("Unknown number", "Неизвестный номер")
+    } else {
+        peer
+    }
+}
+
+fn format_time(unix: i64, l: Lang) -> String {
     use chrono::{Local, TimeZone};
     let Some(time) = Local.timestamp_opt(unix, 0).single() else {
         return String::new();
@@ -627,29 +703,33 @@ fn format_time(unix: i64) -> String {
     if day == today {
         time.format("%H:%M").to_string()
     } else if today.pred_opt() == Some(day) {
-        format!("вчера, {}", time.format("%H:%M"))
+        format!("{}, {}", l.t("yesterday", "вчера"), time.format("%H:%M"))
+    } else if l == Lang::English {
+        time.format("%b %-d, %H:%M").to_string()
     } else {
         time.format("%d.%m, %H:%M").to_string()
     }
 }
 
-fn format_duration(secs: u64) -> String {
+fn format_duration(secs: u64, l: Lang) -> String {
+    let (h, min, s) = (l.t("h", "ч"), l.t("min", "мин"), l.t("s", "с"));
     if secs >= 3600 {
-        format!("{} ч {:02} мин", secs / 3600, secs % 3600 / 60)
+        format!("{} {h} {:02} {min}", secs / 3600, secs % 3600 / 60)
     } else if secs >= 60 {
-        format!("{} мин {:02} с", secs / 60, secs % 60)
+        format!("{} {min} {:02} {s}", secs / 60, secs % 60)
     } else {
-        format!("{secs} с")
+        format!("{secs} {s}")
     }
 }
 
-// ---------------------------------------------------------------- звонок
+// ---------------------------------------------------------------- call
 
 impl PhoneApp {
     fn call_screen(&mut self, ui: &mut Ui) {
         let Some(call) = self.call.clone() else {
             return;
         };
+        let l = self.lang();
 
         ui.add_space(40.0);
         let avatar = ui.allocate_space(vec2(ui.available_width(), 108.0)).1;
@@ -657,12 +737,17 @@ impl PhoneApp {
 
         ui.add_space(18.0);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new(&call.peer).size(28.0).strong().color(TEXT));
+            ui.label(
+                RichText::new(peer_label(&call.peer, l))
+                    .size(28.0)
+                    .strong()
+                    .color(TEXT),
+            );
             ui.add_space(4.0);
             let (status, color) = match call.phase {
-                Phase::Dialing => ("Набираем…".to_string(), MUTED),
-                Phase::Ringing => ("Идёт вызов…".to_string(), MUTED),
-                Phase::Incoming => ("Входящий звонок".to_string(), ACCENT),
+                Phase::Dialing => (l.t("Dialing…", "Набираем…").to_string(), MUTED),
+                Phase::Ringing => (l.t("Ringing…", "Идёт вызов…").to_string(), MUTED),
+                Phase::Incoming => (l.t("Incoming call", "Входящий звонок").to_string(), ACCENT),
                 Phase::Active => (
                     call.connected_at
                         .map(|t| format_clock(t.elapsed().as_secs()))
@@ -678,10 +763,26 @@ impl PhoneApp {
             Phase::Incoming => {
                 let rect = ui.allocate_space(vec2(ui.available_width(), 56.0)).1;
                 let (left, right) = split_row(rect, 12.0);
-                if pill_in(ui, left, "reject", RED, "Отклонить", Color32::WHITE, true) {
+                if pill_in(
+                    ui,
+                    left,
+                    "reject",
+                    RED,
+                    l.t("Decline", "Отклонить"),
+                    Color32::WHITE,
+                    true,
+                ) {
                     self.send(Command::Reject);
                 }
-                if pill_in(ui, right, "answer", GREEN, "Ответить", Color32::WHITE, true) {
+                if pill_in(
+                    ui,
+                    right,
+                    "answer",
+                    GREEN,
+                    l.t("Answer", "Ответить"),
+                    Color32::WHITE,
+                    true,
+                ) {
                     self.send(Command::Answer);
                 }
             }
@@ -689,9 +790,9 @@ impl PhoneApp {
                 let rect = ui.allocate_space(vec2(ui.available_width(), 46.0)).1;
                 let (left, right) = split_row(rect, 12.0);
                 let mute_label = if self.muted {
-                    "Включить микрофон"
+                    l.t("Unmute", "Включить микрофон")
                 } else {
-                    "Без звука"
+                    l.t("Mute", "Без звука")
                 };
                 let mute_fill = if self.muted { AMBER } else { SURFACE_HI };
                 let mute_text = if self.muted { Color32::BLACK } else { TEXT };
@@ -700,7 +801,15 @@ impl PhoneApp {
                     self.send(Command::SetMute(self.muted));
                 }
                 let pad_fill = if self.keypad_open { ACCENT } else { SURFACE_HI };
-                if pill_in(ui, right, "pad", pad_fill, "Клавиши", TEXT, true) {
+                if pill_in(
+                    ui,
+                    right,
+                    "pad",
+                    pad_fill,
+                    l.t("Keypad", "Клавиши"),
+                    TEXT,
+                    true,
+                ) {
                     self.keypad_open = !self.keypad_open;
                 }
                 ui.add_space(14.0);
@@ -712,12 +821,26 @@ impl PhoneApp {
                     }
                     ui.add_space(10.0);
                 }
-                if pill(ui, 54.0, RED, "Завершить", Color32::WHITE, true) {
+                if pill(
+                    ui,
+                    54.0,
+                    RED,
+                    l.t("End call", "Завершить"),
+                    Color32::WHITE,
+                    true,
+                ) {
                     self.send(Command::Hangup);
                 }
             }
             Phase::Dialing | Phase::Ringing => {
-                if pill(ui, 54.0, RED, "Отменить", Color32::WHITE, true) {
+                if pill(
+                    ui,
+                    54.0,
+                    RED,
+                    l.t("Cancel", "Отменить"),
+                    Color32::WHITE,
+                    true,
+                ) {
                     self.send(Command::Hangup);
                 }
             }
@@ -749,9 +872,9 @@ fn draw_avatar(ui: &Ui, center: Pos2, radius: f32) {
     );
 }
 
-// -------------------------------------------------------------- элементы
+// -------------------------------------------------------------- widgets
 
-/// Цифровая клавиатура 3 колонки. Возвращает нажатую клавишу.
+/// Three-column digit keypad. Returns the key that was pressed.
 fn keypad(ui: &mut Ui, keys: &[&'static str]) -> Option<&'static str> {
     const DIAMETER: f32 = 64.0;
     const GAP: f32 = 14.0;
@@ -793,7 +916,7 @@ fn keypad(ui: &mut Ui, keys: &[&'static str]) -> Option<&'static str> {
     pressed
 }
 
-/// Кнопка-«таблетка» на всю ширину. Возвращает true при нажатии.
+/// A full-width pill button. Returns true when clicked.
 fn pill(
     ui: &mut Ui,
     height: f32,
@@ -874,4 +997,47 @@ fn apply_style(ctx: &egui::Context) {
         v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
         style.spacing.item_spacing = vec2(8.0, 6.0);
     });
+}
+
+/// Two-segment language switch. Shows full names, or short codes when `compact`.
+/// Returns the language the user picked this frame, if any.
+fn language_switch(ui: &mut Ui, rect: Rect, current: Lang, compact: bool) -> Option<Lang> {
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same((rect.height() / 2.0) as u8),
+        SURFACE,
+    );
+    let segment_width = rect.width() / Lang::ALL.len() as f32;
+    let mut picked = None;
+    for (i, lang) in Lang::ALL.into_iter().enumerate() {
+        let segment = Rect::from_min_size(
+            pos2(rect.left() + segment_width * i as f32, rect.top()),
+            vec2(segment_width, rect.height()),
+        )
+        .shrink(3.0);
+        let response = ui.interact(
+            segment,
+            ui.id().with(("language", compact, i)),
+            Sense::click(),
+        );
+        let active = lang == current;
+        if active {
+            ui.painter().rect_filled(
+                segment,
+                CornerRadius::same((segment.height() / 2.0) as u8),
+                SURFACE_HI,
+            );
+        }
+        ui.painter().text(
+            segment.center(),
+            Align2::CENTER_CENTER,
+            if compact { lang.code() } else { lang.name() },
+            FontId::proportional(if compact { 12.5 } else { 13.5 }),
+            if active { TEXT } else { MUTED },
+        );
+        if response.clicked() {
+            picked = Some(lang);
+        }
+    }
+    picked
 }

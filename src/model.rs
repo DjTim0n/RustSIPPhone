@@ -1,4 +1,4 @@
-//! Общие типы: что умеет ядро телефона и о чём оно сообщает интерфейсу.
+//! Shared types: what the phone core can do and what it reports to the interface.
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -6,14 +6,14 @@ use std::time::Instant;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Account {
-    /// Адрес станции вместе с портом, например `192.168.1.10:5060`.
+    /// Station (PBX) address with the port, for example `192.168.1.10:5060`.
     pub server: String,
-    /// Внутренний номер (он же логин).
+    /// Extension number (also the login).
     pub extension: String,
     pub password: String,
 }
 
-/// Что интерфейс просит сделать ядро.
+/// What the interface asks the core to do.
 #[derive(Debug)]
 pub enum Command {
     Register(Account),
@@ -32,9 +32,9 @@ pub enum RegState {
     Offline,
     Connecting,
     Online,
-    /// Текст уже на человеческом языке. `retry` — ядро будет пробовать снова само.
+    /// `retry` means the core keeps trying on its own.
     Failed {
-        message: String,
+        notice: Notice,
         retry: bool,
     },
 }
@@ -47,13 +47,13 @@ pub enum Direction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
-    /// Набираем, ответа от станции ещё нет.
+    /// Dialling, the station has not answered yet.
     Dialing,
-    /// Телефон абонента звонит.
+    /// The other phone is ringing.
     Ringing,
-    /// Нам звонят, ждём решения.
+    /// Someone is calling us, waiting for a decision.
     Incoming,
-    /// Разговор идёт.
+    /// The call is in progress.
     Active,
 }
 
@@ -78,25 +78,25 @@ pub struct HistoryEntry {
     pub number: String,
     pub direction: Direction,
     pub outcome: Outcome,
-    /// Начало звонка, секунды с 1970 года.
+    /// Call start, seconds since 1970.
     pub started_at: i64,
     pub duration_secs: u64,
 }
 
-/// О чём ядро сообщает интерфейсу.
+/// What the core reports to the interface.
 #[derive(Debug)]
 pub enum Event {
     Reg(RegState),
     Call(Option<CallView>),
     CallEnded {
         entry: HistoryEntry,
-        /// Что показать человеку, если звонок закончился не разговором.
-        message: Option<String>,
+        /// What to show the user if the call ended without a conversation.
+        notice: Option<Notice>,
     },
-    Toast(String),
+    Toast(Notice),
 }
 
-/// Отправка событий интерфейсу с пробуждением его отрисовки.
+/// Sends events to the interface and wakes up its rendering.
 #[derive(Clone)]
 pub struct Events {
     tx: std::sync::mpsc::Sender<Event>,
@@ -121,26 +121,36 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Понятное объяснение, почему станция отклонила вызов.
-pub fn describe_call_status(code: u16) -> String {
-    match code {
-        404 | 604 => "Такого номера нет".into(),
-        480 | 503 => "Абонент сейчас недоступен".into(),
-        486 | 600 => "Абонент занят".into(),
-        603 | 487 => "Абонент сбросил вызов".into(),
-        401 | 403 | 407 => "Станция не разрешила этот звонок".into(),
-        408 | 504 => "Станция не отвечает".into(),
-        _ => format!("Не удалось дозвониться (код {code})"),
-    }
+/// A user-facing message, kept language-neutral so the interface can show it in any language
+/// (and re-translate it when the language is switched). See `i18n.rs` for the texts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Notice {
+    SignInFirst,
+    FinishCurrentCall,
+    ServerNotFound,
+    NoNetwork,
+    PhoneStartFailed(String),
+    ServerAddressInvalid,
+    RegistrationRetrying,
+    /// SIP status code the station answered the registration with.
+    RegistrationRejected(u16),
+    /// SIP status code the station answered the call with.
+    CallRejected(u16),
+    AudioUnavailable(String),
+    SoundSetupFailed(String),
+    CannotDial,
+    ServerNotResponding,
+    NoAnswerFromServer,
+    SoundNegotiationFailed(String),
+    IncomingNoCommonAudio(String),
+    IncomingFailed,
+    Missed(String),
+    AnswerFailed,
+    PeerEndedCall,
+    NoAudioReceived,
+    PasswordNotSaved,
 }
 
-/// Понятное объяснение, почему не удалось войти.
-pub fn describe_register_status(code: u16) -> String {
-    match code {
-        401 | 403 | 407 => {
-            "Станция не приняла номер или пароль. Проверьте и попробуйте снова".into()
-        }
-        404 => "Станция не знает такой номер".into(),
-        _ => format!("Станция ответила отказом (код {code})"),
-    }
-}
+/// Stored in place of a caller's number when the request does not say who is calling.
+/// The interface shows it as a localized "Unknown number".
+pub const UNKNOWN_PEER: &str = "?";

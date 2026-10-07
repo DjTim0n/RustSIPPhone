@@ -1,5 +1,6 @@
-//! Хранение аккаунта и истории звонков. Пароль лежит в Keychain, остальное — в JSON-файле.
+//! Storage for the account and call history. The password lives in the keychain, the rest in a JSON file.
 
+use crate::i18n::Lang;
 use crate::model::{Account, HistoryEntry};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -15,6 +16,9 @@ pub struct Stored {
     pub extension: String,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
+    /// Interface language. Missing in older files, which then default to English.
+    #[serde(default)]
+    pub language: Lang,
 }
 
 fn path() -> Option<PathBuf> {
@@ -57,13 +61,43 @@ pub fn load_password(server: &str, extension: &str) -> Option<String> {
 
 pub fn save_password(account: &Account) -> Result<(), String> {
     keychain_entry(&account.server, &account.extension)
-        .ok_or("Не удалось открыть связку ключей")?
+        .ok_or("could not open the keychain")?
         .set_password(&account.password)
-        .map_err(|e| format!("Не удалось сохранить пароль: {e}"))
+        .map_err(|e| format!("could not save the password: {e}"))
 }
 
 pub fn forget_password(server: &str, extension: &str) {
     if let Some(entry) = keychain_entry(server, extension) {
         let _ = entry.delete_credential();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_from_older_versions_default_to_english() {
+        let old = r#"{ "server": "10.0.0.1:5060", "extension": "300", "history": [] }"#;
+        let stored: Stored = serde_json::from_str(old).unwrap();
+        assert_eq!(stored.language, Lang::English);
+        assert_eq!(stored.extension, "300");
+    }
+
+    #[test]
+    fn language_survives_a_round_trip() {
+        let stored = Stored {
+            language: Lang::Russian,
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&stored).unwrap();
+        let back: Stored = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.language, Lang::Russian);
+    }
+
+    #[test]
+    fn empty_settings_file_defaults_to_english() {
+        let stored: Stored = serde_json::from_str("{}").unwrap();
+        assert_eq!(stored.language, Lang::English);
     }
 }
