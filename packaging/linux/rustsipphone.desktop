@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Телефон
+Comment=Звонки по SIP
+Exec=rust_sip_phone
+Icon=rustsipphone
+Terminal=false
+Categories=Network;Telephony;

@@ -1,0 +1,19 @@
+[package]
+name = "rust_sip_phone"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rsipstack = { version = "0.6.13"}
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-std", "io-util"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+cpal = "0.18.2"
+eframe = "0.36.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+dirs = "7.0.0"
+chrono = "0.4.45"
+keyring = "4.2.0"
+
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1.31"
