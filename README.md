@@ -37,11 +37,11 @@ Grab the package for your system from the **[latest release](https://github.com/
 
 | System | Package | What's inside |
 | --- | --- | --- |
-| 🍎 **macOS** 11+ (Apple Silicon and Intel) | [`RustSIPPhone-1.0.0.dmg`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.0/RustSIPPhone-1.0.0.dmg) | Disk image with `RustSIPPhone.app` |
-| 🪟 **Windows** 10+ (64-bit) | [`RustSIPPhone-windows.zip`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.0/RustSIPPhone-windows.zip) | `rust_sip_phone.exe` |
-| 🐧 **Linux** (x86_64) | [`RustSIPPhone-linux-x86_64.tar.gz`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.0/RustSIPPhone-linux-x86_64.tar.gz) | Binary, desktop entry and icon |
+| 🍎 **macOS** 11+ (Apple Silicon and Intel) | [`RustSIPPhone-1.0.1.dmg`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.1/RustSIPPhone-1.0.1.dmg) | Disk image with `RustSIPPhone.app` |
+| 🪟 **Windows** 10+ (64-bit) | [`RustSIPPhone-windows.zip`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.1/RustSIPPhone-windows.zip) | `rust_sip_phone.exe` |
+| 🐧 **Linux** (x86_64) | [`RustSIPPhone-linux-x86_64.tar.gz`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.1/RustSIPPhone-linux-x86_64.tar.gz) | Binary, desktop entry and icon |
 
-Every release also includes [`SHA256SUMS.txt`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.0/SHA256SUMS.txt) so you can [verify your download](#-verify-your-download).
+Every release also includes [`SHA256SUMS.txt`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.1/SHA256SUMS.txt) so you can [verify your download](#-verify-your-download).
 
 ## 🚀 Quick start
 
@@ -165,7 +165,7 @@ cargo test
 | Target | Command | Result |
 | --- | --- | --- |
 | macOS `.app` | `./scripts/bundle-macos.sh` | `dist/RustSIPPhone.app` |
-| macOS `.app` + `.dmg` | `./scripts/bundle-macos.sh --dmg` | `dist/RustSIPPhone-1.0.0.dmg` |
+| macOS `.app` + `.dmg` | `./scripts/bundle-macos.sh --dmg` | `dist/RustSIPPhone-1.0.1.dmg` |
 | macOS universal (Intel + Apple Silicon) | `./scripts/bundle-macos.sh --universal --dmg` | one app for both |
 | Windows / Linux | `cargo build --release` | `target/release/rust_sip_phone[.exe]` |
 
