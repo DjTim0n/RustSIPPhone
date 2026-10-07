@@ -45,6 +45,9 @@ pub(super) struct SettingsDraft {
     pub missing: bool,
 }
 
+/// The project's home on GitHub, linked from the About card.
+const REPOSITORY_URL: &str = "https://github.com/DjTim0n/RustSIPPhone";
+
 /// Renewal times offered in the list, in seconds.
 const EXPIRY_PRESETS: [u32; 7] = [30, 60, 120, 300, 600, 1800, 3600];
 
@@ -532,6 +535,8 @@ impl PhoneApp {
                     .size(13.0)
                     .color(MUTED),
                 );
+                ui.add_space(10.0);
+                link(ui, "GitHub: DjTim0n/RustSIPPhone", REPOSITORY_URL);
             });
         ui.add_space(8.0);
         chosen_language
@@ -552,6 +557,30 @@ fn hint(ui: &mut Ui, text: &str) {
             .size(12.0)
             .color(MUTED.gamma_multiply(0.85)),
     );
+}
+
+/// A link in the accent colour that opens `url` in the browser, underlined while the mouse is on it.
+fn link(ui: &mut Ui, text: &str, url: &str) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), FontId::proportional(14.0), ACCENT);
+    let size = galley.size();
+    let rect = ui.allocate_space(vec2(size.x, size.y + 4.0)).1;
+    let response = ui
+        .interact(rect, ui.id().with(("link", url)), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(url);
+    ui.painter().galley(rect.min, galley, ACCENT);
+    if response.hovered() {
+        let y = rect.min.y + size.y + 1.0;
+        ui.painter().line_segment(
+            [pos2(rect.min.x, y), pos2(rect.min.x + size.x, y)],
+            Stroke::new(1.0, ACCENT),
+        );
+    }
+    if response.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
 }
 
 fn draw_chevron_left(ui: &Ui, center: Pos2, color: Color32) {
@@ -1038,6 +1067,49 @@ mod tests {
             image.save(&path).expect("the PNG can be written");
             println!("wrote {}", path.display());
         }
+    }
+
+    #[test]
+    fn the_github_link_opens_the_repository() {
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let mut centre = Pos2::ZERO;
+        frame(&ctx, time, vec![], |ui| {
+            let top_left = ui.available_rect_before_wrap().min;
+            link(ui, "GitHub: DjTim0n/RustSIPPhone", REPOSITORY_URL);
+            centre = top_left + vec2(40.0, 9.0);
+        });
+        let at = centre;
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let mut opened = Vec::new();
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![button(true)],
+            vec![button(false)],
+        ] {
+            time += 0.05;
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 720.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                link(ui, "GitHub: DjTim0n/RustSIPPhone", REPOSITORY_URL)
+            });
+            output.textures_delta.clear();
+            for command in &output.platform_output.commands {
+                if let egui::OutputCommand::OpenUrl(open) = command {
+                    opened.push(open.url.clone());
+                }
+            }
+        }
+        assert_eq!(opened, vec![REPOSITORY_URL.to_string()]);
     }
 
     #[test]
