@@ -37,24 +37,22 @@ Grab the package for your system from the **[latest release](https://github.com/
 
 | System | Package | What's inside |
 | --- | --- | --- |
-| 🍎 **macOS** 11+ (Apple Silicon and Intel) | [`RustSIPPhone-1.0.1.dmg`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.1/RustSIPPhone-1.0.1.dmg) | Disk image with `RustSIPPhone.app` |
-| 🪟 **Windows** 10+ (64-bit) | [`RustSIPPhone-windows.zip`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.1/RustSIPPhone-windows.zip) | `rust_sip_phone.exe` |
-| 🐧 **Linux** (x86_64) | [`RustSIPPhone-linux-x86_64.tar.gz`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.1/RustSIPPhone-linux-x86_64.tar.gz) | Binary, desktop entry and icon |
+| 🍎 **macOS** 11+ (Apple Silicon and Intel) | [`RustSIPPhone-1.0.2.dmg`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.2/RustSIPPhone-1.0.2.dmg) | Disk image with `RustSIPPhone.app` |
+| 🪟 **Windows** 10+ (64-bit) | [`RustSIPPhone-windows.zip`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.2/RustSIPPhone-windows.zip) | `rust_sip_phone.exe` |
+| 🐧 **Linux** (x86_64) | [`RustSIPPhone-linux-x86_64.tar.gz`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.2/RustSIPPhone-linux-x86_64.tar.gz) | Binary, desktop entry and icon |
 
-Every release also includes [`SHA256SUMS.txt`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.1/SHA256SUMS.txt) so you can [verify your download](#-verify-your-download).
+Every release also includes [`SHA256SUMS.txt`](https://github.com/DjTim0n/RustSIPPhone/releases/download/v1.0.2/SHA256SUMS.txt) so you can [verify your download](#-verify-your-download).
 
 ## 🚀 Quick start
 
 ### macOS
 
 1. Open the `.dmg` and drag **RustSIPPhone** into **Applications**.
-2. Open it from Applications. The first time, macOS may say the app is from an unidentified developer — the app is open source and signed ad-hoc, not notarized. **Right-click the app → Open → Open**.
-   Or from Terminal:
-   ```bash
-   xattr -dr com.apple.quarantine /Applications/RustSIPPhone.app
-   ```
+2. Open it from Applications. Release builds are signed with a Developer ID certificate and **notarized by Apple**, so they open normally, with no security warning.
 3. Allow **Microphone** access when asked. Without it calls cannot start.
 4. Allow **Keychain** access if prompted — that is where your password is stored.
+
+> Built it yourself, or downloaded a CI artifact instead of a release? Those are only ad-hoc signed, and macOS may say it "could not verify" the app. Open **System Settings → Privacy & Security**, scroll to *Security* and press **Open Anyway** — or run `xattr -dr com.apple.quarantine /Applications/RustSIPPhone.app`. Apps you build on your own Mac open without any warning.
 
 ### Windows
 
@@ -116,13 +114,21 @@ Get-FileHash .\RustSIPPhone-windows.zip -Algorithm SHA256
 
 You should see `OK` next to your file name.
 
-**2. Check the macOS signature.**
+**2. Check the macOS signature and notarization.**
 
 ```bash
 codesign --verify --deep --strict --verbose=2 /Applications/RustSIPPhone.app
-codesign -dv /Applications/RustSIPPhone.app 2>&1 | grep -E "Identifier|Signature"
+codesign -dvv /Applications/RustSIPPhone.app 2>&1 | grep -E "Identifier|Authority=Developer|TeamIdentifier"
 # Identifier=com.rustsipphone.app
-# Signature=adhoc
+# Authority=Developer ID Application: INSTITUT REPRODUKTIVNOI MEDITSINY, TOO (7SXHSZ7GU6)
+# TeamIdentifier=7SXHSZ7GU6
+
+spctl --assess --type exec --verbose=2 /Applications/RustSIPPhone.app
+# /Applications/RustSIPPhone.app: accepted
+# source=Notarized Developer ID
+
+xcrun stapler validate /Applications/RustSIPPhone.app
+# The validate action worked!
 ```
 
 **3. Check that it works.**
@@ -165,13 +171,14 @@ cargo test
 | Target | Command | Result |
 | --- | --- | --- |
 | macOS `.app` | `./scripts/bundle-macos.sh` | `dist/RustSIPPhone.app` |
-| macOS `.app` + `.dmg` | `./scripts/bundle-macos.sh --dmg` | `dist/RustSIPPhone-1.0.1.dmg` |
+| macOS `.app` + `.dmg` | `./scripts/bundle-macos.sh --dmg` | `dist/RustSIPPhone-1.0.2.dmg` |
 | macOS universal (Intel + Apple Silicon) | `./scripts/bundle-macos.sh --universal --dmg` | one app for both |
+| macOS signed and notarized | `./scripts/bundle-macos.sh --universal --dmg --notarize` | ready to distribute |
 | Windows / Linux | `cargo build --release` | `target/release/rust_sip_phone[.exe]` |
 
-Set `SIGN_IDENTITY="Developer ID Application: …"` to sign with your own Apple certificate instead of the default ad-hoc signature.
+By default the app gets an ad-hoc signature, which is enough on your own Mac. To distribute it, sign with your own Apple Developer ID: set `SIGN_IDENTITY="Developer ID Application: …"`, or pass `--notarize`, which finds the certificate in your keychain, sends the app and the disk image to Apple and staples the result. Notarization needs credentials; the header of [`scripts/bundle-macos.sh`](scripts/bundle-macos.sh) shows the three ways to supply them.
 
-Releases are built by [GitHub Actions](.github/workflows/build.yml) on macOS, Windows and Linux. Push a tag like `v1.0.0` and the workflow publishes the packages and checksums.
+Releases are built by [GitHub Actions](.github/workflows/build.yml) on macOS, Windows and Linux. Push a tag like `v1.0.2` and the workflow publishes the packages and checksums. On tags (and manual runs) the macOS build is signed and notarized when these repository secrets exist: `APPLE_CERTIFICATE_P12` (base64), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD`.
 
 ## 🧭 How it works
 

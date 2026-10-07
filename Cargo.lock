@@ -3691,7 +3691,7 @@ dependencies = [
 
 [[package]]
 name = "rust_sip_phone"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "cpal",
