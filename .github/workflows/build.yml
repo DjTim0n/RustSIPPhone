@@ -105,8 +105,12 @@ jobs:
           path: out
           merge-multiple: true
 
-      # Без сторонних действий: релиз создаёт официальный gh, который уже есть на раннере.
-      - name: Создать релиз
+      - name: Write checksums
+        working-directory: out
+        run: sha256sum RustSIPPhone-* > SHA256SUMS.txt
+
+      # No third-party actions here: the release is created with the official gh CLI.
+      - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" --generate-notes

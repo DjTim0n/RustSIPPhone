@@ -68,7 +68,10 @@ impl PhoneApp {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let repaint_ctx = cc.egui_ctx.clone();
-        let events = Events::new(event_tx, std::sync::Arc::new(move || repaint_ctx.request_repaint()));
+        let events = Events::new(
+            event_tx,
+            std::sync::Arc::new(move || repaint_ctx.request_repaint()),
+        );
         let engine = runtime.spawn(crate::engine::run(command_rx, events));
 
         let stored = store::load();
@@ -166,7 +169,11 @@ impl PhoneApp {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Reg(state) => {
-                    if let RegState::Failed { message, retry: false } = &state {
+                    if let RegState::Failed {
+                        message,
+                        retry: false,
+                    } = &state
+                    {
                         // Станция не приняла данные: возвращаем человека к форме.
                         self.signed_in = false;
                         self.form.error = Some(message.clone());
@@ -229,7 +236,11 @@ impl eframe::App for PhoneApp {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(16)))
+            .frame(
+                egui::Frame::new()
+                    .fill(BG)
+                    .inner_margin(egui::Margin::same(16)),
+            )
             .show(ui, |ui| {
                 let full = ui.available_rect_before_wrap();
                 let width = full.width().min(COLUMN_WIDTH);
@@ -265,7 +276,12 @@ impl eframe::App for PhoneApp {
 impl PhoneApp {
     fn login_screen(&mut self, ui: &mut Ui) {
         ui.add_space(36.0);
-        ui.label(RichText::new("Вход в телефон").size(26.0).strong().color(TEXT));
+        ui.label(
+            RichText::new("Вход в телефон")
+                .size(26.0)
+                .strong()
+                .color(TEXT),
+        );
         ui.add_space(6.0);
         ui.label(
             RichText::new("Введите данные, которые выдал администратор")
@@ -275,10 +291,21 @@ impl PhoneApp {
         ui.add_space(28.0);
 
         let connecting = matches!(self.reg, RegState::Connecting) && self.signed_in;
-        field(ui, "Адрес станции", "например, 192.168.1.10:5060", &mut self.form.server, false);
-        field(ui, "Внутренний номер", "например, 300", &mut self.form.extension, false);
-        let password_response =
-            field(ui, "Пароль", "", &mut self.form.password, true);
+        field(
+            ui,
+            "Адрес станции",
+            "например, 192.168.1.10:5060",
+            &mut self.form.server,
+            false,
+        );
+        field(
+            ui,
+            "Внутренний номер",
+            "например, 300",
+            &mut self.form.extension,
+            false,
+        );
+        let password_response = field(ui, "Пароль", "", &mut self.form.password, true);
 
         if let Some(error) = &self.form.error {
             ui.add_space(4.0);
@@ -290,8 +317,19 @@ impl PhoneApp {
             && !self.form.extension.trim().is_empty()
             && !self.form.password.is_empty();
         let enter = password_response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-        let label = if connecting { "Подключаемся…" } else { "Войти" };
-        if pill(ui, 52.0, ACCENT, label, Color32::WHITE, ready && !connecting) && ready
+        let label = if connecting {
+            "Подключаемся…"
+        } else {
+            "Войти"
+        };
+        if pill(
+            ui,
+            52.0,
+            ACCENT,
+            label,
+            Color32::WHITE,
+            ready && !connecting,
+        ) && ready
             || (enter && ready && !connecting)
         {
             self.submit_login();
@@ -299,7 +337,13 @@ impl PhoneApp {
     }
 }
 
-fn field(ui: &mut Ui, label: &str, hint: &str, value: &mut String, password: bool) -> egui::Response {
+fn field(
+    ui: &mut Ui,
+    label: &str,
+    hint: &str,
+    value: &mut String,
+    password: bool,
+) -> egui::Response {
     ui.label(RichText::new(label).size(13.0).color(MUTED));
     ui.add_space(4.0);
     let response = ui.add(
@@ -360,13 +404,16 @@ impl PhoneApp {
             FontId::proportional(12.5),
             MUTED,
         );
-        let exit_rect = Rect::from_center_size(
-            pos2(rect.right() - 36.0, rect.center().y),
-            vec2(72.0, 32.0),
-        );
+        let exit_rect =
+            Rect::from_center_size(pos2(rect.right() - 36.0, rect.center().y), vec2(72.0, 32.0));
         let response = ui.interact(exit_rect, ui.id().with("sign_out"), Sense::click());
-        let fill = if response.hovered() { SURFACE_HI } else { SURFACE };
-        ui.painter().rect_filled(exit_rect, CornerRadius::same(16), fill);
+        let fill = if response.hovered() {
+            SURFACE_HI
+        } else {
+            SURFACE
+        };
+        ui.painter()
+            .rect_filled(exit_rect, CornerRadius::same(16), fill);
         ui.painter().text(
             exit_rect.center(),
             Align2::CENTER_CENTER,
@@ -380,7 +427,9 @@ impl PhoneApp {
     }
 
     fn toast_banner(&mut self, ui: &mut Ui) {
-        let Some((message, _)) = &self.toast else { return };
+        let Some((message, _)) = &self.toast else {
+            return;
+        };
         egui::Frame::new()
             .fill(SURFACE_HI)
             .corner_radius(CornerRadius::same(10))
@@ -394,9 +443,13 @@ impl PhoneApp {
 
     fn tab_switch(&mut self, ui: &mut Ui) {
         let rect = ui.allocate_space(vec2(ui.available_width(), 40.0)).1;
-        ui.painter().rect_filled(rect, CornerRadius::same(20), SURFACE);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(20), SURFACE);
         let half = rect.width() / 2.0;
-        for (i, (tab, label)) in [(Tab::Dial, "Набор"), (Tab::Recent, "Недавние")].into_iter().enumerate() {
+        for (i, (tab, label)) in [(Tab::Dial, "Набор"), (Tab::Recent, "Недавние")]
+            .into_iter()
+            .enumerate()
+        {
             let tab_rect = Rect::from_min_size(
                 pos2(rect.left() + half * i as f32, rect.top()),
                 vec2(half, rect.height()),
@@ -405,7 +458,8 @@ impl PhoneApp {
             let response = ui.interact(tab_rect, ui.id().with(("tab", i)), Sense::click());
             let active = self.tab == tab;
             if active {
-                ui.painter().rect_filled(tab_rect, CornerRadius::same(17), SURFACE_HI);
+                ui.painter()
+                    .rect_filled(tab_rect, CornerRadius::same(17), SURFACE_HI);
             }
             ui.painter().text(
                 tab_rect.center(),
@@ -426,7 +480,11 @@ impl PhoneApp {
             TextEdit::singleline(&mut self.number)
                 .font(FontId::proportional(34.0))
                 .horizontal_align(Align::Center)
-                .hint_text(RichText::new("Введите номер").size(22.0).color(MUTED.gamma_multiply(0.6)))
+                .hint_text(
+                    RichText::new("Введите номер")
+                        .size(22.0)
+                        .color(MUTED.gamma_multiply(0.6)),
+                )
                 .desired_width(f32::INFINITY)
                 .frame(egui::Frame::NONE)
                 .margin(vec2(0.0, 10.0)),
@@ -467,7 +525,11 @@ impl PhoneApp {
         if !matches!(self.reg, RegState::Online) {
             ui.add_space(6.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Звонить можно, когда телефон на связи").size(12.5).color(MUTED));
+                ui.label(
+                    RichText::new("Звонить можно, когда телефон на связи")
+                        .size(12.5)
+                        .color(MUTED),
+                );
             });
         }
     }
@@ -478,49 +540,60 @@ impl PhoneApp {
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("Звонков пока не было").size(16.0).color(TEXT));
                 ui.add_space(4.0);
-                ui.label(RichText::new("Здесь появятся ваши звонки").size(13.5).color(MUTED));
+                ui.label(
+                    RichText::new("Здесь появятся ваши звонки")
+                        .size(13.5)
+                        .color(MUTED),
+                );
             });
             return;
         }
         let mut chosen: Option<String> = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (i, entry) in self.stored.history.iter().enumerate() {
-                let rect = ui.allocate_space(vec2(ui.available_width(), 58.0)).1;
-                let response = ui.interact(rect, ui.id().with(("recent", i)), Sense::click());
-                if response.hovered() {
-                    ui.painter().rect_filled(rect, CornerRadius::same(10), SURFACE);
-                }
-                let (color, kind) = history_kind(entry);
-                let painter = ui.painter();
-                painter.circle_filled(pos2(rect.left() + 14.0, rect.center().y), 5.0, color);
-                painter.text(
-                    pos2(rect.left() + 32.0, rect.center().y - 10.0),
-                    Align2::LEFT_CENTER,
-                    &entry.number,
-                    FontId::proportional(16.0),
-                    if entry.outcome == Outcome::Missed { RED } else { TEXT },
-                );
-                painter.text(
-                    pos2(rect.left() + 32.0, rect.center().y + 11.0),
-                    Align2::LEFT_CENTER,
-                    format!("{kind} · {}", format_time(entry.started_at)),
-                    FontId::proportional(12.5),
-                    MUTED,
-                );
-                if entry.duration_secs > 0 {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, entry) in self.stored.history.iter().enumerate() {
+                    let rect = ui.allocate_space(vec2(ui.available_width(), 58.0)).1;
+                    let response = ui.interact(rect, ui.id().with(("recent", i)), Sense::click());
+                    if response.hovered() {
+                        ui.painter()
+                            .rect_filled(rect, CornerRadius::same(10), SURFACE);
+                    }
+                    let (color, kind) = history_kind(entry);
+                    let painter = ui.painter();
+                    painter.circle_filled(pos2(rect.left() + 14.0, rect.center().y), 5.0, color);
                     painter.text(
-                        pos2(rect.right() - 8.0, rect.center().y),
-                        Align2::RIGHT_CENTER,
-                        format_duration(entry.duration_secs),
-                        FontId::proportional(13.0),
+                        pos2(rect.left() + 32.0, rect.center().y - 10.0),
+                        Align2::LEFT_CENTER,
+                        &entry.number,
+                        FontId::proportional(16.0),
+                        if entry.outcome == Outcome::Missed {
+                            RED
+                        } else {
+                            TEXT
+                        },
+                    );
+                    painter.text(
+                        pos2(rect.left() + 32.0, rect.center().y + 11.0),
+                        Align2::LEFT_CENTER,
+                        format!("{kind} · {}", format_time(entry.started_at)),
+                        FontId::proportional(12.5),
                         MUTED,
                     );
+                    if entry.duration_secs > 0 {
+                        painter.text(
+                            pos2(rect.right() - 8.0, rect.center().y),
+                            Align2::RIGHT_CENTER,
+                            format_duration(entry.duration_secs),
+                            FontId::proportional(13.0),
+                            MUTED,
+                        );
+                    }
+                    if response.clicked() {
+                        chosen = Some(entry.number.clone());
+                    }
                 }
-                if response.clicked() {
-                    chosen = Some(entry.number.clone());
-                }
-            }
-        });
+            });
         if let Some(number) = chosen {
             // В журнале номер может быть с именем: «Имя (300)» — для набора берём то, что в скобках.
             let dialable = match (number.rfind('('), number.rfind(')')) {
@@ -574,7 +647,9 @@ fn format_duration(secs: u64) -> String {
 
 impl PhoneApp {
     fn call_screen(&mut self, ui: &mut Ui) {
-        let Some(call) = self.call.clone() else { return };
+        let Some(call) = self.call.clone() else {
+            return;
+        };
 
         ui.add_space(40.0);
         let avatar = ui.allocate_space(vec2(ui.available_width(), 108.0)).1;
@@ -613,7 +688,11 @@ impl PhoneApp {
             Phase::Active => {
                 let rect = ui.allocate_space(vec2(ui.available_width(), 46.0)).1;
                 let (left, right) = split_row(rect, 12.0);
-                let mute_label = if self.muted { "Включить микрофон" } else { "Без звука" };
+                let mute_label = if self.muted {
+                    "Включить микрофон"
+                } else {
+                    "Без звука"
+                };
                 let mute_fill = if self.muted { AMBER } else { SURFACE_HI };
                 let mute_text = if self.muted { Color32::BLACK } else { TEXT };
                 if pill_in(ui, left, "mute", mute_fill, mute_label, mute_text, true) {
@@ -658,8 +737,16 @@ fn draw_avatar(ui: &Ui, center: Pos2, radius: f32) {
     let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
     let painter = ui.painter().with_clip_rect(rect);
     painter.circle_filled(center, radius, SURFACE_HI);
-    painter.circle_filled(pos2(center.x, center.y - radius * 0.2), radius * 0.28, MUTED);
-    painter.circle_filled(pos2(center.x, center.y + radius * 0.85), radius * 0.55, MUTED);
+    painter.circle_filled(
+        pos2(center.x, center.y - radius * 0.2),
+        radius * 0.28,
+        MUTED,
+    );
+    painter.circle_filled(
+        pos2(center.x, center.y + radius * 0.85),
+        radius * 0.55,
+        MUTED,
+    );
 }
 
 // -------------------------------------------------------------- элементы
@@ -707,7 +794,14 @@ fn keypad(ui: &mut Ui, keys: &[&'static str]) -> Option<&'static str> {
 }
 
 /// Кнопка-«таблетка» на всю ширину. Возвращает true при нажатии.
-fn pill(ui: &mut Ui, height: f32, fill: Color32, label: &str, text: Color32, enabled: bool) -> bool {
+fn pill(
+    ui: &mut Ui,
+    height: f32,
+    fill: Color32,
+    label: &str,
+    text: Color32,
+    enabled: bool,
+) -> bool {
     let rect = ui.allocate_space(vec2(ui.available_width(), height)).1;
     pill_in(ui, rect, label, fill, label, text, enabled)
 }
@@ -721,7 +815,11 @@ fn pill_in(
     text: Color32,
     enabled: bool,
 ) -> bool {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let response = ui.interact(rect, ui.id().with(("pill", id)), sense);
     let mut color = fill;
     if !enabled {
@@ -738,7 +836,11 @@ fn pill_in(
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(if rect.height() > 50.0 { 17.0 } else { 15.0 }),
-        if enabled { text } else { text.gamma_multiply(0.6) },
+        if enabled {
+            text
+        } else {
+            text.gamma_multiply(0.6)
+        },
     );
     enabled && response.clicked()
 }
@@ -747,7 +849,10 @@ fn split_row(rect: Rect, gap: f32) -> (Rect, Rect) {
     let half = (rect.width() - gap) / 2.0;
     (
         Rect::from_min_size(rect.min, vec2(half, rect.height())),
-        Rect::from_min_size(pos2(rect.min.x + half + gap, rect.min.y), vec2(half, rect.height())),
+        Rect::from_min_size(
+            pos2(rect.min.x + half + gap, rect.min.y),
+            vec2(half, rect.height()),
+        ),
     )
 }
 

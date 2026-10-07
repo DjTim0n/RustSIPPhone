@@ -163,7 +163,10 @@ async fn outgoing(
     let rtp_port = rtp_socket.local_addr().map(|a| a.port()).unwrap_or(0);
     let offer = sdp::build_offer(ctx.local_ip, rtp_port, now_unix() as u64);
 
-    let parse_uri = |text: String| text.parse::<rsipstack::sip::Uri>().map_err(|e| e.to_string());
+    let parse_uri = |text: String| {
+        text.parse::<rsipstack::sip::Uri>()
+            .map_err(|e| e.to_string())
+    };
     let build_invite = || -> Result<InviteOption, String> {
         Ok(InviteOption {
             caller: parse_uri(format!("sip:{}@{}", account.extension, account.server))?,
@@ -180,7 +183,11 @@ async fn outgoing(
     };
     let invite = match build_invite() {
         Ok(invite) => invite,
-        Err(_) => return Finished::failed("Не удалось набрать этот номер. Проверьте, что он введён верно"),
+        Err(_) => {
+            return Finished::failed(
+                "Не удалось набрать этот номер. Проверьте, что он введён верно",
+            );
+        }
     };
 
     let (state_tx, mut state_rx) = ctx.dialog_layer.new_dialog_state_channel();
@@ -274,7 +281,11 @@ fn caller_of(request: &rsipstack::sip::Request) -> String {
         .map(|auth| auth.user.clone())
         .filter(|user| !user.is_empty())
         .unwrap_or_else(|| from.uri.host_with_port.to_string());
-    match from.display_name.as_deref().map(|n| n.trim_matches('"').trim()) {
+    match from
+        .display_name
+        .as_deref()
+        .map(|n| n.trim_matches('"').trim())
+    {
         Some(name) if !name.is_empty() && name != number => format!("{name} ({number})"),
         _ => number,
     }
@@ -295,7 +306,9 @@ async fn incoming(
         Ok(remote) => remote,
         Err(_) => {
             let _ = tx.reply(StatusCode::NotAcceptableHere).await;
-            return Finished::failed(format!("Не удалось принять звонок от {peer}: нет общего способа передачи звука"));
+            return Finished::failed(format!(
+                "Не удалось принять звонок от {peer}: нет общего способа передачи звука"
+            ));
         }
     };
 
@@ -363,7 +376,10 @@ async fn incoming(
         Err(_) => {
             let _ = dialog.reject(Some(StatusCode::TemporarilyUnavailable), None);
             ctx.dialog_layer.remove_dialog(&dialog.id());
-            return Finished::without_talk(Outcome::Missed, Some(format!("Пропущенный звонок: {peer}")));
+            return Finished::without_talk(
+                Outcome::Missed,
+                Some(format!("Пропущенный звонок: {peer}")),
+            );
         }
     }
 
@@ -391,8 +407,13 @@ async fn incoming(
         &[remote.codec],
         remote.dtmf_pt,
     );
-    let headers = vec![rsipstack::sip::Header::ContentType("application/sdp".into())];
-    if dialog.accept(Some(headers), Some(answer.into_bytes())).is_err() {
+    let headers = vec![rsipstack::sip::Header::ContentType(
+        "application/sdp".into(),
+    )];
+    if dialog
+        .accept(Some(headers), Some(answer.into_bytes()))
+        .is_err()
+    {
         ctx.dialog_layer.remove_dialog(&dialog.id());
         return Finished::failed("Не удалось ответить на звонок");
     }
@@ -479,7 +500,8 @@ async fn talk(
     let silent = stats.received == 0 && connected_at.elapsed() > Duration::from_secs(5);
     let message = match (message, silent) {
         (_, true) => Some(
-            "Собеседника не было слышно: звук от него не приходил. Возможно, мешают настройки сети".to_string(),
+            "Собеседника не было слышно: звук от него не приходил. Возможно, мешают настройки сети"
+                .to_string(),
         ),
         (message, false) => message,
     };

@@ -175,8 +175,8 @@ where
             move |data: &[T], _| {
                 let mut out = Vec::with_capacity(data.len() / channels / 4 + 1);
                 for frame in data.chunks(channels) {
-                    let mono = frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>()
-                        / channels as f32;
+                    let mono =
+                        frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / channels as f32;
                     if let Some(sample) = downsampler.push(mono) {
                         out.push((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
                     }

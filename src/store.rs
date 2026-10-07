@@ -18,7 +18,11 @@ pub struct Stored {
 }
 
 fn path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("RustSIPPhone").join("settings.json"))
+    Some(
+        dirs::config_dir()?
+            .join("RustSIPPhone")
+            .join("settings.json"),
+    )
 }
 
 pub fn load() -> Stored {

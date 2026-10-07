@@ -14,10 +14,13 @@ pub fn local_ip_towards(target: SocketAddr) -> std::io::Result<IpAddr> {
 }
 
 pub async fn resolve(server: &str) -> std::io::Result<SocketAddr> {
-    tokio::net::lookup_host(server).await?.next().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("не удалось определить адрес {server}"),
-        )
-    })
+    tokio::net::lookup_host(server)
+        .await?
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("не удалось определить адрес {server}"),
+            )
+        })
 }

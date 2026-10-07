@@ -33,7 +33,10 @@ pub enum RegState {
     Connecting,
     Online,
     /// Текст уже на человеческом языке. `retry` — ядро будет пробовать снова само.
-    Failed { message: String, retry: bool },
+    Failed {
+        message: String,
+        retry: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,10 +104,7 @@ pub struct Events {
 }
 
 impl Events {
-    pub fn new(
-        tx: std::sync::mpsc::Sender<Event>,
-        repaint: Arc<dyn Fn() + Send + Sync>,
-    ) -> Self {
+    pub fn new(tx: std::sync::mpsc::Sender<Event>, repaint: Arc<dyn Fn() + Send + Sync>) -> Self {
         Events { tx, repaint }
     }
 
@@ -125,7 +125,7 @@ pub fn now_unix() -> i64 {
 pub fn describe_call_status(code: u16) -> String {
     match code {
         404 | 604 => "Такого номера нет".into(),
-        480 | 503 =>"Абонент сейчас недоступен".into(),
+        480 | 503 => "Абонент сейчас недоступен".into(),
         486 | 600 => "Абонент занят".into(),
         603 | 487 => "Абонент сбросил вызов".into(),
         401 | 403 | 407 => "Станция не разрешила этот звонок".into(),
@@ -137,7 +137,9 @@ pub fn describe_call_status(code: u16) -> String {
 /// Понятное объяснение, почему не удалось войти.
 pub fn describe_register_status(code: u16) -> String {
     match code {
-        401 | 403 | 407 => "Станция не приняла номер или пароль. Проверьте и попробуйте снова".into(),
+        401 | 403 | 407 => {
+            "Станция не приняла номер или пароль. Проверьте и попробуйте снова".into()
+        }
         404 => "Станция не знает такой номер".into(),
         _ => format!("Станция ответила отказом (код {code})"),
     }

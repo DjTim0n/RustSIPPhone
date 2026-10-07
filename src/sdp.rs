@@ -14,7 +14,10 @@ pub fn build_sdp(
     codecs: &[Codec],
     dtmf_pt: Option<u8>,
 ) -> String {
-    let mut formats: Vec<String> = codecs.iter().map(|c| c.payload_type().to_string()).collect();
+    let mut formats: Vec<String> = codecs
+        .iter()
+        .map(|c| c.payload_type().to_string())
+        .collect();
     if let Some(pt) = dtmf_pt {
         formats.push(pt.to_string());
     }
@@ -134,7 +137,13 @@ mod tests {
 
     #[test]
     fn answer_lists_only_chosen_codec() {
-        let sdp = build_sdp("10.0.0.2".parse().unwrap(), 5004, 7, &[Codec::Pcma], Some(96));
+        let sdp = build_sdp(
+            "10.0.0.2".parse().unwrap(),
+            5004,
+            7,
+            &[Codec::Pcma],
+            Some(96),
+        );
         assert!(sdp.contains("m=audio 5004 RTP/AVP 8 96\r\n"));
         assert!(!sdp.contains("PCMU"));
         assert!(sdp.contains("a=rtpmap:96 telephone-event/8000\r\n"));

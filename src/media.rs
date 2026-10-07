@@ -48,7 +48,15 @@ pub async fn run(
 
     let filter = PeerFilter::new(remote.addr.ip(), signalling_ip);
     let ((), received) = tokio::join!(
-        send_loop(&socket, codec, dtmf_pt, &mut audio.mic, control, remote_rx, &stop),
+        send_loop(
+            &socket,
+            codec,
+            dtmf_pt,
+            &mut audio.mic,
+            control,
+            remote_rx,
+            &stop
+        ),
         receive_loop(&socket, codec, speaker, remote_tx, filter, &stop),
     );
     MediaStats { received }
@@ -228,7 +236,9 @@ const NAT_LEARN_PACKETS: u32 = 5;
 enum Verdict {
     Drop,
     /// `latch` is true only for the very first accepted packet.
-    Accept { latch: bool },
+    Accept {
+        latch: bool,
+    },
 }
 
 struct Candidate {
@@ -371,20 +381,45 @@ mod tests {
 
     #[test]
     fn pins_first_trusted_source_and_ssrc() {
-        let mut f = PeerFilter::new("203.0.113.5".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        let mut f = PeerFilter::new(
+            "203.0.113.5".parse().unwrap(),
+            "203.0.113.9".parse().unwrap(),
+        );
         let t = Duration::ZERO;
-        assert_eq!(f.check(addr("203.0.113.5:4000"), &header(7, 1), t), Verdict::Accept { latch: true });
-        assert_eq!(f.check(addr("203.0.113.5:4000"), &header(7, 2), t), Verdict::Accept { latch: false });
+        assert_eq!(
+            f.check(addr("203.0.113.5:4000"), &header(7, 1), t),
+            Verdict::Accept { latch: true }
+        );
+        assert_eq!(
+            f.check(addr("203.0.113.5:4000"), &header(7, 2), t),
+            Verdict::Accept { latch: false }
+        );
         // Same IP, other port or other SSRC: refused after pinning.
-        assert_eq!(f.check(addr("203.0.113.5:4002"), &header(7, 3), t), Verdict::Drop);
-        assert_eq!(f.check(addr("203.0.113.5:4000"), &header(8, 3), t), Verdict::Drop);
+        assert_eq!(
+            f.check(addr("203.0.113.5:4002"), &header(7, 3), t),
+            Verdict::Drop
+        );
+        assert_eq!(
+            f.check(addr("203.0.113.5:4000"), &header(8, 3), t),
+            Verdict::Drop
+        );
     }
 
     #[test]
     fn stranger_cannot_pin_before_the_real_peer() {
-        let mut f = PeerFilter::new("203.0.113.5".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        let mut f = PeerFilter::new(
+            "203.0.113.5".parse().unwrap(),
+            "203.0.113.9".parse().unwrap(),
+        );
         for seq in 0..50 {
-            assert_eq!(f.check(addr("198.51.100.66:9999"), &header(666, seq), Duration::ZERO), Verdict::Drop);
+            assert_eq!(
+                f.check(
+                    addr("198.51.100.66:9999"),
+                    &header(666, seq),
+                    Duration::ZERO
+                ),
+                Verdict::Drop
+            );
         }
         assert_eq!(
             f.check(addr("203.0.113.5:4000"), &header(7, 1), Duration::ZERO),
@@ -394,7 +429,10 @@ mod tests {
 
     #[test]
     fn signalling_server_is_trusted() {
-        let mut f = PeerFilter::new("203.0.113.5".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        let mut f = PeerFilter::new(
+            "203.0.113.5".parse().unwrap(),
+            "203.0.113.9".parse().unwrap(),
+        );
         assert_eq!(
             f.check(addr("203.0.113.9:20000"), &header(1, 1), Duration::ZERO),
             Verdict::Accept { latch: true }
@@ -404,12 +442,21 @@ mod tests {
     #[test]
     fn nat_learning_needs_a_sequential_burst() {
         // SDP says 192.168.1.20, but the audio really comes from a public address.
-        let mut f = PeerFilter::new("192.168.1.20".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        let mut f = PeerFilter::new(
+            "192.168.1.20".parse().unwrap(),
+            "203.0.113.9".parse().unwrap(),
+        );
         let src = addr("198.51.100.7:5004");
         for seq in 10..14 {
-            assert_eq!(f.check(src, &header(3, seq), Duration::from_secs(1)), Verdict::Drop);
+            assert_eq!(
+                f.check(src, &header(3, seq), Duration::from_secs(1)),
+                Verdict::Drop
+            );
         }
-        assert_eq!(f.check(src, &header(3, 14), Duration::from_secs(1)), Verdict::Accept { latch: true });
+        assert_eq!(
+            f.check(src, &header(3, 14), Duration::from_secs(1)),
+            Verdict::Accept { latch: true }
+        );
     }
 
     #[test]
@@ -417,16 +464,28 @@ mod tests {
         let src = addr("198.51.100.7:5004");
         let mut gap = PeerFilter::new("10.0.0.2".parse().unwrap(), "203.0.113.9".parse().unwrap());
         for seq in [1u16, 2, 4, 5, 6, 8, 9] {
-            assert_eq!(gap.check(src, &header(3, seq), Duration::from_secs(1)), Verdict::Drop);
+            assert_eq!(
+                gap.check(src, &header(3, seq), Duration::from_secs(1)),
+                Verdict::Drop
+            );
         }
         let mut late = PeerFilter::new("10.0.0.2".parse().unwrap(), "203.0.113.9".parse().unwrap());
         for seq in 0..20 {
-            assert_eq!(late.check(src, &header(3, seq), Duration::from_secs(30)), Verdict::Drop);
+            assert_eq!(
+                late.check(src, &header(3, seq), Duration::from_secs(30)),
+                Verdict::Drop
+            );
         }
         // A publicly routable SDP address means "no NAT": never learn a different IP.
-        let mut public = PeerFilter::new("203.0.113.5".parse().unwrap(), "203.0.113.9".parse().unwrap());
+        let mut public = PeerFilter::new(
+            "203.0.113.5".parse().unwrap(),
+            "203.0.113.9".parse().unwrap(),
+        );
         for seq in 0..20 {
-            assert_eq!(public.check(src, &header(3, seq), Duration::from_secs(1)), Verdict::Drop);
+            assert_eq!(
+                public.check(src, &header(3, seq), Duration::from_secs(1)),
+                Verdict::Drop
+            );
         }
     }
 }
