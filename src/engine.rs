@@ -91,8 +91,7 @@ impl Session {
         let server_addr = net::resolve(&account.server)
             .await
             .map_err(|_| "Не удалось найти станцию по этому адресу. Проверьте, как он написан")?;
-        let local_ip = net::local_ip_towards(server_addr)
-            .map_err(|_| "Нет подключения к сети")?;
+        let local_ip = net::local_ip_towards(server_addr).map_err(|_| "Нет подключения к сети")?;
         let account = Arc::new(account);
 
         let cancel = CancellationToken::new();
@@ -115,7 +114,12 @@ impl Session {
                 let _ = inner.serve().await;
             }
         });
-        let incoming = tokio::spawn(incoming_loop(endpoint.incoming_transactions().map_err(|e| e.to_string())?, ctx.clone()));
+        let incoming = tokio::spawn(incoming_loop(
+            endpoint
+                .incoming_transactions()
+                .map_err(|e| e.to_string())?,
+            ctx.clone(),
+        ));
         let registration = tokio::spawn(registration_loop(
             endpoint.inner.clone(),
             account,
@@ -165,6 +169,7 @@ async fn create_endpoint(
     builder.with_transport_layer(transport_layer);
     builder.with_cancel_token(cancel);
     builder.with_user_agent("RustSIPPhone/0.1");
+    builder.with_inspector(Box::new(SourceStamp));
     Ok(builder.build())
 }
 
@@ -276,47 +281,116 @@ async fn incoming_loop(
     }
 }
 
-/// Where the request really came from. The stack strips any `received` value a sender put in
-/// the top Via and writes the actual source itself; it leaves it out only when the sent-by
-/// host already equals the source, so the sent-by IP is the fallback.
+/// Header the transport layer stamps on every received request with the address the packet
+/// really came from. Anything a sender puts under this name is discarded first.
+const SOURCE_HEADER: &str = "X-Verified-Source";
+
+/// Message inspector that records the true UDP source of each incoming request.
+///
+/// The `Via` header cannot be used for this: its `received` parameter is only rewritten when it
+/// disagrees with the sent-by address, so a forged value can survive, and values after the first
+/// comma are parsed differently by different code. The `from` address handed to the inspector
+/// comes from the socket itself.
+struct SourceStamp;
+
+impl rsipstack::transaction::endpoint::MessageInspector for SourceStamp {
+    fn before_send(
+        &self,
+        msg: rsipstack::sip::SipMessage,
+        _dest: Option<&rsipstack::transport::SipAddr>,
+    ) -> rsipstack::sip::SipMessage {
+        msg
+    }
+
+    fn after_received(
+        &self,
+        mut msg: rsipstack::sip::SipMessage,
+        from: Option<&rsipstack::transport::SipAddr>,
+    ) -> rsipstack::sip::SipMessage {
+        if let rsipstack::sip::SipMessage::Request(request) = &mut msg {
+            request.headers.retain(|header| !is_source_header(header));
+            if let Some(from) = from {
+                request.headers.push(rsipstack::sip::Header::Other(
+                    SOURCE_HEADER.to_string(),
+                    from.addr.host.to_string(),
+                ));
+            }
+        }
+        msg
+    }
+}
+
+fn is_source_header(header: &rsipstack::sip::Header) -> bool {
+    matches!(header, rsipstack::sip::Header::Other(name, _) if name.eq_ignore_ascii_case(SOURCE_HEADER))
+}
+
+/// The IP a request really came from, or `None` if it was not stamped (treated as untrusted).
 fn request_source_ip(request: &rsipstack::sip::Request) -> Option<std::net::IpAddr> {
-    use rsipstack::sip::prelude::{HeadersExt, ToTypedHeader};
-    let via = request.via_header().ok()?.typed().ok()?;
-    via.params
-        .iter()
-        .find_map(|param| match param {
-            rsipstack::sip::Param::Received(received) => received.to_string().parse().ok(),
-            _ => None,
-        })
-        .or_else(|| via.uri.host_with_port.host.to_string().parse().ok())
+    request.headers.iter().find_map(|header| match header {
+        rsipstack::sip::Header::Other(name, value) if name.eq_ignore_ascii_case(SOURCE_HEADER) => {
+            value.trim().parse().ok()
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    fn invite(via: &str) -> rsipstack::sip::Request {
-        let raw = format!(
-            "INVITE sip:300@203.0.113.9 SIP/2.0\r\nVia: {via}\r\nFrom: <sip:100@x>;tag=1\r\nTo: <sip:300@x>\r\nCall-ID: abc\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+    const FORGED_INVITE: &str = "INVITE sip:300@127.0.0.1 SIP/2.0\r\n\
+        Via: SIP/2.0/UDP 127.0.0.1:5999;branch=z9hG4bK1;received=203.0.113.9\r\n\
+        Via: SIP/2.0/UDP 10.0.0.1;received=203.0.113.9\r\n\
+        X-Verified-Source: 203.0.113.9\r\n\
+        x-verified-source: 203.0.113.9\r\n\
+        From: <sip:100@x>;tag=1\r\nTo: <sip:300@x>\r\nCall-ID: forged-1\r\n\
+        CSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+
+    /// A stranger on 127.0.0.1 forges every field that could name the server (203.0.113.9).
+    /// The endpoint must still report the real source.
+    #[tokio::test]
+    async fn forged_headers_do_not_change_the_verified_source() {
+        let cancel = CancellationToken::new();
+        let endpoint = create_endpoint("127.0.0.1".parse().unwrap(), cancel.clone())
+            .await
+            .expect("endpoint");
+        let target = endpoint.get_addrs()[0].addr.to_string();
+        let mut incoming = endpoint.incoming_transactions().expect("incoming");
+        let inner = endpoint.inner.clone();
+        let serve = tokio::spawn(async move { inner.serve().await });
+
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(FORGED_INVITE.as_bytes(), &target)
+            .await
+            .unwrap();
+
+        let transaction = tokio::time::timeout(Duration::from_secs(5), incoming.recv())
+            .await
+            .expect("INVITE should reach the endpoint")
+            .expect("channel open");
+        assert_eq!(
+            request_source_ip(&transaction.original),
+            Some("127.0.0.1".parse().unwrap())
         );
-        rsipstack::sip::Request::try_from(raw.as_str()).expect("valid request")
+        let stamps = transaction
+            .original
+            .headers
+            .iter()
+            .filter(|h| is_source_header(h))
+            .count();
+        assert_eq!(stamps, 1, "forged copies must be removed");
+
+        endpoint.shutdown();
+        let _ = serve.await;
     }
 
     #[test]
-    fn source_is_received_param_when_present() {
-        let req = invite("SIP/2.0/UDP 10.0.0.5:5060;branch=z9hG4bK1;received=203.0.113.9");
-        assert_eq!(request_source_ip(&req), Some("203.0.113.9".parse().unwrap()));
-    }
-
-    #[test]
-    fn source_falls_back_to_sent_by_ip() {
-        let req = invite("SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bK1");
-        assert_eq!(request_source_ip(&req), Some("203.0.113.9".parse().unwrap()));
-    }
-
-    #[test]
-    fn unknown_source_is_not_trusted() {
-        let req = invite("SIP/2.0/UDP pbx.example.com:5060;branch=z9hG4bK1");
-        assert_eq!(request_source_ip(&req), None);
+    fn unstamped_request_is_untrusted() {
+        let raw = "INVITE sip:300@x SIP/2.0\r\nVia: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bK1\r\n\
+                   From: <sip:1@x>;tag=1\r\nTo: <sip:300@x>\r\nCall-ID: a\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let request = rsipstack::sip::Request::try_from(raw).expect("valid request");
+        assert_eq!(request_source_ip(&request), None);
     }
 }
