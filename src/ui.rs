@@ -64,6 +64,9 @@ pub struct PhoneApp {
     call: Option<CallView>,
     muted: bool,
     keypad_open: bool,
+    /// The transfer panel of the call screen is open, with the target typed so far.
+    transfer_open: bool,
+    transfer_target: String,
     toast: Option<(Notice, Instant)>,
     /// The user chose to quit, so the next close request really closes the window.
     quitting: bool,
@@ -115,6 +118,8 @@ impl PhoneApp {
             call: None,
             muted: false,
             keypad_open: false,
+            transfer_open: false,
+            transfer_target: String::new(),
             toast: None,
             quitting: false,
             in_background: false,
@@ -123,6 +128,7 @@ impl PhoneApp {
             devices: AudioDevices::default(),
         };
         app.send(Command::SetAudio(app.stored.audio.clone()));
+        app.send(Command::SetCalls(app.stored.calls.clone()));
         app.try_auto_login();
         app
     }
@@ -222,6 +228,8 @@ impl PhoneApp {
                     if view.is_none() || self.call.is_none() {
                         self.muted = false;
                         self.keypad_open = false;
+                        self.transfer_open = false;
+                        self.transfer_target.clear();
                     }
                     self.call = view;
                 }
@@ -536,6 +544,7 @@ impl PhoneApp {
     fn phone_screen(&mut self, ui: &mut Ui) {
         self.header(ui);
         ui.add_space(10.0);
+        self.dnd_banner(ui);
         self.toast_banner(ui);
         self.tab_switch(ui);
         ui.add_space(12.0);
@@ -709,7 +718,7 @@ impl PhoneApp {
         }
         ui.add_space(6.0);
 
-        if let Some(key) = keypad(ui, &DIAL_KEYS) {
+        if let Some(key) = keypad(ui, &DIAL_KEYS, 64.0, 14.0) {
             self.number.push_str(key);
         }
         ui.add_space(14.0);
@@ -879,11 +888,11 @@ impl PhoneApp {
         };
         let l = self.lang();
 
-        ui.add_space(40.0);
-        let avatar = ui.allocate_space(vec2(ui.available_width(), 108.0)).1;
-        draw_avatar(ui, avatar.center(), 52.0);
+        ui.add_space(28.0);
+        let avatar = ui.allocate_space(vec2(ui.available_width(), 92.0)).1;
+        draw_avatar(ui, avatar.center(), 44.0);
 
-        ui.add_space(18.0);
+        ui.add_space(14.0);
         ui.vertical_centered(|ui| {
             ui.label(
                 RichText::new(peer_label(&call.peer, l))
@@ -892,21 +901,35 @@ impl PhoneApp {
                     .color(TEXT),
             );
             ui.add_space(4.0);
+            let timer = call
+                .connected_at
+                .map(|t| format_clock(t.elapsed().as_secs()))
+                .unwrap_or_default();
             let (status, color) = match call.phase {
                 Phase::Dialing => (l.t("Dialing…", "Набираем…").to_string(), MUTED),
                 Phase::Ringing => (l.t("Ringing…", "Идёт вызов…").to_string(), MUTED),
                 Phase::Incoming => (l.t("Incoming call", "Входящий звонок").to_string(), ACCENT),
-                Phase::Active => (
-                    call.connected_at
-                        .map(|t| format_clock(t.elapsed().as_secs()))
-                        .unwrap_or_default(),
-                    GREEN,
+                Phase::Active if call.transferring => (
+                    format!("{timer} · {}", l.t("Transferring…", "Переводим…")),
+                    ACCENT,
                 ),
+                Phase::Active if call.remote_hold => (
+                    format!(
+                        "{timer} · {}",
+                        l.t("On hold by the other side", "Вас поставили на удержание")
+                    ),
+                    AMBER,
+                ),
+                Phase::Active if call.local_hold => (
+                    format!("{timer} · {}", l.t("On hold", "На удержании")),
+                    AMBER,
+                ),
+                Phase::Active => (timer, GREEN),
             };
             ui.label(RichText::new(status).size(16.0).color(color));
         });
 
-        ui.add_space(24.0);
+        ui.add_space(16.0);
         match call.phase {
             Phase::Incoming => {
                 let rect = ui.allocate_space(vec2(ui.available_width(), 56.0)).1;
@@ -935,7 +958,8 @@ impl PhoneApp {
                 }
             }
             Phase::Active => {
-                let rect = ui.allocate_space(vec2(ui.available_width(), 46.0)).1;
+                // Two rows of two buttons: mute and hold, keypad and transfer.
+                let rect = ui.allocate_space(vec2(ui.available_width(), 44.0)).1;
                 let (left, right) = split_row(rect, 12.0);
                 let mute_label = if self.muted {
                     l.t("Unmute", "Включить микрофон")
@@ -948,10 +972,27 @@ impl PhoneApp {
                     self.muted = !self.muted;
                     self.send(Command::SetMute(self.muted));
                 }
+                let hold_label = if call.local_hold {
+                    l.t("Resume", "Вернуть")
+                } else {
+                    l.t("Hold", "Удержать")
+                };
+                let hold_fill = if call.local_hold { AMBER } else { SURFACE_HI };
+                let hold_text = if call.local_hold {
+                    Color32::BLACK
+                } else {
+                    TEXT
+                };
+                if pill_in(ui, right, "hold", hold_fill, hold_label, hold_text, true) {
+                    self.send(Command::Hold(!call.local_hold));
+                }
+                ui.add_space(10.0);
+                let rect = ui.allocate_space(vec2(ui.available_width(), 44.0)).1;
+                let (left, right) = split_row(rect, 12.0);
                 let pad_fill = if self.keypad_open { ACCENT } else { SURFACE_HI };
                 if pill_in(
                     ui,
-                    right,
+                    left,
                     "pad",
                     pad_fill,
                     l.t("Keypad", "Клавиши"),
@@ -959,14 +1000,36 @@ impl PhoneApp {
                     true,
                 ) {
                     self.keypad_open = !self.keypad_open;
+                    self.transfer_open = false;
                 }
-                ui.add_space(14.0);
+                let transfer_fill = if self.transfer_open {
+                    ACCENT
+                } else {
+                    SURFACE_HI
+                };
+                if pill_in(
+                    ui,
+                    right,
+                    "transfer",
+                    transfer_fill,
+                    l.t("Transfer", "Перевести"),
+                    TEXT,
+                    !call.transferring,
+                ) {
+                    self.transfer_open = !self.transfer_open;
+                    self.keypad_open = false;
+                }
+                ui.add_space(12.0);
                 if self.keypad_open {
-                    if let Some(key) = keypad(ui, &DIAL_KEYS) {
+                    if let Some(key) = keypad(ui, &DIAL_KEYS, 54.0, 10.0) {
                         if let Some(digit) = key.chars().next() {
                             self.send(Command::Dtmf(digit));
                         }
                     }
+                    ui.add_space(10.0);
+                }
+                if self.transfer_open {
+                    self.transfer_panel(ui, l);
                     ui.add_space(10.0);
                 }
                 if pill(
@@ -993,6 +1056,79 @@ impl PhoneApp {
                 }
             }
         }
+    }
+}
+
+impl PhoneApp {
+    /// Asks where to transfer the call to and sends the request.
+    fn transfer_panel(&mut self, ui: &mut Ui, l: Lang) {
+        let field = ui.add(
+            TextEdit::singleline(&mut self.transfer_target)
+                .hint_text(
+                    RichText::new(l.t(
+                        "number or address to transfer to",
+                        "номер или адрес, куда перевести",
+                    ))
+                    .color(MUTED.gamma_multiply(0.7)),
+                )
+                .desired_width(f32::INFINITY)
+                .margin(vec2(14.0, 12.0))
+                .font(FontId::proportional(16.0)),
+        );
+        field.request_focus();
+        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        ui.add_space(8.0);
+        let ready = !self.transfer_target.trim().is_empty();
+        if (pill(
+            ui,
+            44.0,
+            ACCENT,
+            l.t("Transfer now", "Перевести"),
+            Color32::WHITE,
+            ready,
+        ) || enter)
+            && ready
+        {
+            let target = std::mem::take(&mut self.transfer_target);
+            self.send(Command::Transfer(target.trim().to_string()));
+            self.transfer_open = false;
+        }
+    }
+
+    /// A reminder, above the dialer, that incoming calls are being turned away.
+    fn dnd_banner(&mut self, ui: &mut Ui) {
+        if !self.stored.calls.do_not_disturb {
+            return;
+        }
+        let l = self.lang();
+        let rect = ui.allocate_space(vec2(ui.available_width(), 38.0)).1;
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(12), AMBER.gamma_multiply(0.16));
+        ui.painter().text(
+            pos2(rect.left() + 14.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            l.t("Do not disturb is on", "«Не беспокоить» включён"),
+            FontId::proportional(13.5),
+            AMBER,
+        );
+        let off =
+            Rect::from_center_size(pos2(rect.right() - 44.0, rect.center().y), vec2(80.0, 28.0));
+        let response = ui
+            .interact(off, ui.id().with("dnd_off"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        ui.painter().text(
+            off.center(),
+            Align2::CENTER_CENTER,
+            l.t("Turn off", "Выключить"),
+            FontId::proportional(13.5),
+            if response.hovered() { TEXT } else { ACCENT },
+        );
+        if response.clicked() {
+            self.stored.calls.do_not_disturb = false;
+            store::save(&self.stored);
+            self.send(Command::SetCalls(self.stored.calls.clone()));
+        }
+        ui.add_space(10.0);
     }
 }
 
@@ -1023,12 +1159,10 @@ fn draw_avatar(ui: &Ui, center: Pos2, radius: f32) {
 // -------------------------------------------------------------- widgets
 
 /// Three-column digit keypad. Returns the key that was pressed.
-fn keypad(ui: &mut Ui, keys: &[&'static str]) -> Option<&'static str> {
-    const DIAMETER: f32 = 64.0;
-    const GAP: f32 = 14.0;
+fn keypad(ui: &mut Ui, keys: &[&'static str], diameter: f32, gap: f32) -> Option<&'static str> {
     let rows = keys.len().div_ceil(3);
-    let width = DIAMETER * 3.0 + GAP * 2.0;
-    let height = DIAMETER * rows as f32 + GAP * (rows as f32 - 1.0);
+    let width = diameter * 3.0 + gap * 2.0;
+    let height = diameter * rows as f32 + gap * (rows as f32 - 1.0);
     let available = ui.available_width();
     let (_, area) = ui.allocate_space(vec2(available, height));
     let left = area.center().x - width / 2.0;
@@ -1037,10 +1171,10 @@ fn keypad(ui: &mut Ui, keys: &[&'static str]) -> Option<&'static str> {
     for (i, key) in keys.iter().enumerate() {
         let (row, col) = (i / 3, i % 3);
         let center = pos2(
-            left + DIAMETER / 2.0 + col as f32 * (DIAMETER + GAP),
-            area.top() + DIAMETER / 2.0 + row as f32 * (DIAMETER + GAP),
+            left + diameter / 2.0 + col as f32 * (diameter + gap),
+            area.top() + diameter / 2.0 + row as f32 * (diameter + gap),
         );
-        let rect = Rect::from_center_size(center, Vec2::splat(DIAMETER));
+        let rect = Rect::from_center_size(center, Vec2::splat(diameter));
         let response = ui.interact(rect, ui.id().with(("key", i)), Sense::click());
         let fill = if response.is_pointer_button_down_on() {
             ACCENT.gamma_multiply(0.5)
@@ -1049,7 +1183,7 @@ fn keypad(ui: &mut Ui, keys: &[&'static str]) -> Option<&'static str> {
         } else {
             SURFACE
         };
-        ui.painter().circle_filled(center, DIAMETER / 2.0, fill);
+        ui.painter().circle_filled(center, diameter / 2.0, fill);
         ui.painter().text(
             center,
             Align2::CENTER_CENTER,

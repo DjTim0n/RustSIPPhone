@@ -1,7 +1,7 @@
 //! Shared types: what the phone core can do and what it reports to the interface.
 
 use crate::settings::{
-    AudioSettings, ConnectionSettings, escape_user, host_for_uri, split_host_port,
+    AudioSettings, CallSettings, ConnectionSettings, escape_user, host_for_uri, split_host_port,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -86,6 +86,12 @@ pub enum Command {
     Dtmf(char),
     /// Use these microphone and speaker for the calls that follow.
     SetAudio(AudioSettings),
+    /// How calls behave: do not disturb, auto-answer, keypad tones.
+    SetCalls(CallSettings),
+    /// Put the current call on hold (`true`) or take it off hold (`false`).
+    Hold(bool),
+    /// Transfer the current call to this number or address.
+    Transfer(String),
     Shutdown,
 }
 
@@ -124,6 +130,25 @@ pub struct CallView {
     pub peer: String,
     pub phase: Phase,
     pub connected_at: Option<Instant>,
+    /// We put the call on hold.
+    pub local_hold: bool,
+    /// The other side put the call on hold.
+    pub remote_hold: bool,
+    /// A transfer has been requested and not yet confirmed.
+    pub transferring: bool,
+}
+
+impl CallView {
+    pub fn new(peer: &str, phase: Phase) -> Self {
+        CallView {
+            peer: peer.to_string(),
+            phase,
+            connected_at: None,
+            local_hold: false,
+            remote_hold: false,
+            transferring: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +236,14 @@ pub enum Notice {
     PeerEndedCall,
     NoAudioReceived,
     PasswordNotSaved,
+    /// The station refused to hold or resume the call; the code is its answer.
+    HoldFailed(u16),
+    /// The station refused the transfer; the code is its answer.
+    TransferFailed(u16),
+    /// A transfer was requested but the station never confirmed it.
+    TransferUnconfirmed,
+    /// The call was handed over to this number or address.
+    Transferred(String),
     /// The connection to the station could not be set up; the text is the technical reason.
     ConnectionFailed(String),
     /// The secure connection failed, usually because of the station's certificate.

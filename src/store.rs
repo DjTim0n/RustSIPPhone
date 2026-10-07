@@ -2,7 +2,7 @@
 
 use crate::i18n::Lang;
 use crate::model::{Account, HistoryEntry};
-use crate::settings::{AudioSettings, ConnectionSettings};
+use crate::settings::{AudioSettings, CallSettings, ConnectionSettings};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -25,6 +25,8 @@ pub struct Stored {
     pub connection: ConnectionSettings,
     #[serde(default)]
     pub audio: AudioSettings,
+    #[serde(default)]
+    pub calls: CallSettings,
 }
 
 /// Where the settings file lives. `RUSTSIPPHONE_CONFIG_DIR` overrides the system's location, which

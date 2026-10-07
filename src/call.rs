@@ -5,7 +5,7 @@ use crate::media::{self, MediaControl};
 use crate::model::*;
 use crate::ringtone::{Ringtone, Tone};
 use crate::sdp;
-use crate::settings::AudioSettings;
+use crate::settings::{AudioSettings, CallSettings};
 use rsipstack::dialog::authenticate::Credential;
 use rsipstack::dialog::dialog::DialogState;
 use rsipstack::dialog::dialog_layer::DialogLayer;
@@ -24,6 +24,8 @@ use tokio_util::sync::CancellationToken;
 
 /// How long the phone rings before an unanswered incoming call is given up.
 const INCOMING_RING_TIMEOUT: Duration = Duration::from_secs(45);
+/// How long the phone rings before it answers by itself, when auto-answer is on.
+const AUTO_ANSWER_AFTER: Duration = Duration::from_millis(1500);
 
 #[derive(Debug)]
 pub enum CallCtl {
@@ -32,6 +34,10 @@ pub enum CallCtl {
     Hangup,
     Mute(bool),
     Dtmf(char),
+    /// Hold (`true`) or resume (`false`) the call.
+    Hold(bool),
+    /// Hand the call over to this number or address.
+    Transfer(String),
 }
 
 /// We never have more than one call at a time.
@@ -79,6 +85,7 @@ pub struct CallContext {
     /// What registration learned about how the station sees us.
     pub link: SharedLink,
     pub audio: Arc<Mutex<AudioSettings>>,
+    pub calls: Arc<Mutex<CallSettings>>,
     pub events: Events,
     pub slot: Arc<CallSlot>,
 }
@@ -104,6 +111,10 @@ impl CallContext {
         self.link()
             .and_then(|link| link.public_ip)
             .unwrap_or(self.local_ip)
+    }
+
+    fn calls(&self) -> CallSettings {
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn audio_settings(&self) -> AudioSettings {
@@ -136,11 +147,8 @@ impl Finished {
 }
 
 fn publish(ctx: &CallContext, peer: &str, phase: Phase) {
-    ctx.events.send(Event::Call(Some(CallView {
-        peer: peer.to_string(),
-        phase,
-        connected_at: None,
-    })));
+    ctx.events
+        .send(Event::Call(Some(CallView::new(peer, phase))));
 }
 
 fn finish(ctx: &CallContext, direction: Direction, peer: &str, started_at: i64, done: Finished) {
@@ -194,7 +202,8 @@ async fn outgoing(
         Err(err) => return Finished::failed(Notice::SoundSetupFailed(err.to_string())),
     };
     let rtp_port = rtp_socket.local_addr().map(|a| a.port()).unwrap_or(0);
-    let offer = sdp::build_offer(ctx.media_ip(), rtp_port, now_unix() as u64);
+    let session_id = now_unix() as u64;
+    let offer = sdp::build_offer(ctx.media_ip(), rtp_port, session_id);
 
     let parse_uri = |text: String| {
         text.parse::<rsipstack::sip::Uri>()
@@ -251,7 +260,7 @@ async fn outgoing(
                             Some(remote) => {
                                 if let Some(audio) = audio.take() {
                                     ringback = None;
-                                    early = Some(start_media(ctx, rtp_socket.clone(), audio, remote, true));
+                                    early = Some(start_media(ctx, rtp_socket.clone(), audio, remote, true, session_id));
                                 }
                             }
                             None if ringback.is_none() => ringback = start_ringback(ctx).await,
@@ -289,12 +298,24 @@ async fn outgoing(
                 (Some(stale), _) => {
                     drop(stale);
                     AudioIo::start(&ctx.audio_settings()).ok().map(|audio| {
-                        start_media(ctx, rtp_socket.clone(), audio, remote.clone(), false)
+                        start_media(
+                            ctx,
+                            rtp_socket.clone(),
+                            audio,
+                            remote.clone(),
+                            false,
+                            session_id,
+                        )
                     })
                 }
-                (None, Some(audio)) => {
-                    Some(start_media(ctx, rtp_socket.clone(), audio, remote, false))
-                }
+                (None, Some(audio)) => Some(start_media(
+                    ctx,
+                    rtp_socket.clone(),
+                    audio,
+                    remote,
+                    false,
+                    session_id,
+                )),
                 (None, None) => None,
             };
             match media {
@@ -367,6 +388,12 @@ async fn incoming(
 ) -> Finished {
     use rsipstack::sip::StatusCode;
 
+    // Do not disturb: turn the call away at once. It still shows up as a missed call.
+    if ctx.calls().do_not_disturb {
+        let _ = tx.reply(StatusCode::BusyHere).await;
+        return Finished::without_talk(Outcome::Missed, None);
+    }
+
     let remote = match String::from_utf8(tx.original.body().to_vec())
         .map_err(|_| "the request has no audio offer".to_string())
         .and_then(|body| sdp::parse_remote(&body))
@@ -407,9 +434,14 @@ async fn incoming(
             .ok()
             .and_then(Result::ok);
 
+    // With auto-answer the phone picks up by itself after a moment.
+    let auto_answer = ctx.calls().auto_answer;
+    let auto_answer_timer = tokio::time::sleep(AUTO_ANSWER_AFTER);
+    tokio::pin!(auto_answer_timer);
     let decision = tokio::time::timeout(INCOMING_RING_TIMEOUT, async {
         loop {
             tokio::select! {
+                _ = &mut auto_answer_timer, if auto_answer => return Decision::Answer,
                 ctl = ctl_rx.recv() => match ctl {
                     Some(CallCtl::Answer) => return Decision::Answer,
                     Some(CallCtl::Reject | CallCtl::Hangup) => return Decision::Decline,
@@ -462,13 +494,16 @@ async fn incoming(
         }
     };
     let rtp_port = rtp_socket.local_addr().map(|a| a.port()).unwrap_or(0);
-    let answer = sdp::build_sdp(
-        ctx.media_ip(),
+    let session_id = now_unix() as u64;
+    let answer = sdp::build_sdp(&sdp::LocalSdp {
+        ip: ctx.media_ip(),
         rtp_port,
-        now_unix() as u64,
-        &[remote.codec],
-        remote.dtmf_pt,
-    );
+        session_id,
+        version: session_id,
+        codecs: &[remote.codec],
+        dtmf_pt: remote.dtmf_pt,
+        direction: sdp::MediaDirection::SendRecv,
+    });
     let headers = vec![rsipstack::sip::Header::ContentType(
         "application/sdp".into(),
     )];
@@ -480,7 +515,7 @@ async fn incoming(
         return Finished::failed(Notice::AnswerFailed);
     }
 
-    let media = start_media(ctx, rtp_socket, audio, remote, false);
+    let media = start_media(ctx, rtp_socket, audio, remote, false, session_id);
     let result = talk(ctx, &dialog, peer, media, &mut state_rx, &mut ctl_rx).await;
     ctx.dialog_layer.remove_dialog(&dialog.id());
     result
@@ -504,6 +539,9 @@ struct RunningMedia {
     muted: Arc<AtomicBool>,
     dtmf: UnboundedSender<char>,
     remote: sdp::Remote,
+    /// Our RTP port and the id of the session description we sent, which re-offers must reuse.
+    local_port: u16,
+    session_id: u64,
 }
 
 impl Drop for RunningMedia {
@@ -520,7 +558,9 @@ fn start_media(
     audio: AudioIo,
     remote: sdp::Remote,
     muted: bool,
+    session_id: u64,
 ) -> RunningMedia {
+    let local_port = rtp_socket.local_addr().map(|a| a.port()).unwrap_or(0);
     let muted = Arc::new(AtomicBool::new(muted));
     let (dtmf_tx, dtmf_rx) = unbounded_channel();
     let stop = CancellationToken::new();
@@ -541,6 +581,8 @@ fn start_media(
         muted,
         dtmf: dtmf_tx,
         remote,
+        local_port,
+        session_id,
     }
 }
 
@@ -566,6 +608,37 @@ async fn start_ringback(ctx: &CallContext) -> Option<Ringtone> {
 
 // ----------------------------------------------------------------- conversation
 
+/// How long a transfer may stay unconfirmed before the phone stops waiting.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A transfer that was requested and is waiting for the station's confirmation.
+struct PendingTransfer {
+    target: String,
+    since: Instant,
+}
+
+/// Mutable facts about the call that the screen shows.
+struct CallFlags {
+    user_muted: bool,
+    view: CallView,
+    /// The version of the next session description we send; it must keep growing.
+    sdp_version: u64,
+    transfer: Option<PendingTransfer>,
+}
+
+impl CallFlags {
+    fn publish(&self, ctx: &CallContext) {
+        ctx.events.send(Event::Call(Some(self.view.clone())));
+    }
+
+    /// The microphone is off while muted by the user or while the call is on hold.
+    fn apply_mute(&self, media: &RunningMedia) {
+        media
+            .muted
+            .store(self.user_muted || self.view.local_hold, Ordering::Relaxed);
+    }
+}
+
 async fn talk(
     ctx: &CallContext,
     dialog: &InviteDialog,
@@ -575,13 +648,19 @@ async fn talk(
     ctl_rx: &mut UnboundedReceiver<CallCtl>,
 ) -> Finished {
     let connected_at = Instant::now();
-    ctx.events.send(Event::Call(Some(CallView {
-        peer: peer.to_string(),
-        phase: Phase::Active,
-        connected_at: Some(connected_at),
-    })));
+    let mut flags = CallFlags {
+        user_muted: false,
+        view: CallView {
+            connected_at: Some(connected_at),
+            ..CallView::new(peer, Phase::Active)
+        },
+        sdp_version: media.session_id,
+        transfer: None,
+    };
+    flags.publish(ctx);
     // The call is answered: from now on the other side hears us.
-    media.muted.store(false, Ordering::Relaxed);
+    flags.apply_mute(&media);
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
 
     let message = loop {
         tokio::select! {
@@ -590,16 +669,58 @@ async fn talk(
                     let _ = dialog.bye().await;
                     break None;
                 }
-                Some(CallCtl::Mute(on)) => media.muted.store(on, Ordering::Relaxed),
-                Some(CallCtl::Dtmf(digit)) => { let _ = media.dtmf.send(digit); }
+                Some(CallCtl::Mute(on)) => {
+                    flags.user_muted = on;
+                    flags.apply_mute(&media);
+                }
+                Some(CallCtl::Dtmf(digit)) => send_dtmf(ctx, dialog, &media, digit).await,
+                Some(CallCtl::Hold(on)) => {
+                    flags.sdp_version += 1;
+                    let direction = if on { sdp::MediaDirection::SendOnly } else { sdp::MediaDirection::SendRecv };
+                    match renegotiate(ctx, dialog, &media, flags.sdp_version, direction).await {
+                        Ok(()) => {
+                            flags.view.local_hold = on;
+                            flags.apply_mute(&media);
+                            flags.publish(ctx);
+                        }
+                        Err(code) => ctx.events.send(Event::Toast(Notice::HoldFailed(code))),
+                    }
+                }
+                Some(CallCtl::Transfer(target)) => {
+                    match request_transfer(ctx, dialog, &target).await {
+                        Ok(()) => {
+                            flags.transfer = Some(PendingTransfer { target, since: Instant::now() });
+                            flags.view.transferring = true;
+                            flags.publish(ctx);
+                        }
+                        Err(code) => ctx.events.send(Event::Toast(Notice::TransferFailed(code))),
+                    }
+                }
                 Some(CallCtl::Answer) => {}
             },
             state = state_rx.recv() => match state {
                 Some(DialogState::Terminated(..)) | None => {
                     break Some(Notice::PeerEndedCall);
                 }
-                Some(_) => {}
+                Some(DialogState::Notify(_, request, handle)) => {
+                    let _ = handle.reply(rsipstack::sip::StatusCode::OK).await;
+                    if let Some(code) = sipfrag_status(&request) {
+                        if let Some(done) = flags.transfer_progress(ctx, code) {
+                            let _ = dialog.bye().await;
+                            break Some(done);
+                        }
+                    }
+                }
+                Some(state) => answer_in_dialog(ctx, state, &media, &mut flags).await,
             },
+            _ = tick.tick() => {
+                if flags.transfer.as_ref().is_some_and(|t| t.since.elapsed() > TRANSFER_TIMEOUT) {
+                    flags.transfer = None;
+                    flags.view.transferring = false;
+                    flags.publish(ctx);
+                    ctx.events.send(Event::Toast(Notice::TransferUnconfirmed));
+                }
+            }
         }
     };
 
@@ -618,6 +739,171 @@ async fn talk(
         outcome: Outcome::Completed,
         notice,
         connected_at: Some(connected_at),
+    }
+}
+
+impl CallFlags {
+    /// Reacts to a progress report on a transfer (the status code in a NOTIFY). Returns the
+    /// notice to end the call with when the transfer has gone through.
+    fn transfer_progress(&mut self, ctx: &CallContext, code: u16) -> Option<Notice> {
+        let pending = self.transfer.as_ref()?;
+        match code {
+            // 1xx: still trying.
+            100..=199 => None,
+            200..=299 => {
+                let target = pending.target.clone();
+                self.transfer = None;
+                Some(Notice::Transferred(target))
+            }
+            _ => {
+                self.transfer = None;
+                self.view.transferring = false;
+                self.publish(ctx);
+                ctx.events.send(Event::Toast(Notice::TransferFailed(code)));
+                None
+            }
+        }
+    }
+}
+
+/// Sends a key to the other side the way the settings and the other side's abilities allow.
+async fn send_dtmf(ctx: &CallContext, dialog: &InviteDialog, media: &RunningMedia, digit: char) {
+    let tones_negotiated = media.remote.dtmf_pt.is_some();
+    if ctx.calls().dtmf_mode.use_audio_tones(tones_negotiated) {
+        let _ = media.dtmf.send(digit);
+    } else {
+        let headers = vec![rsipstack::sip::Header::ContentType(
+            "application/dtmf-relay".into(),
+        )];
+        let _ = dialog
+            .info(Some(headers), Some(dtmf_relay_body(digit).into_bytes()))
+            .await;
+    }
+}
+
+/// The body of a SIP INFO that carries a key press (the common `application/dtmf-relay` form).
+fn dtmf_relay_body(digit: char) -> String {
+    format!("Signal={digit}\r\nDuration=160\r\n")
+}
+
+/// Sends a new session description in the call (a re-INVITE): this is how a call is put on hold
+/// and taken off hold. Returns the station's status code if it refuses.
+async fn renegotiate(
+    ctx: &CallContext,
+    dialog: &InviteDialog,
+    media: &RunningMedia,
+    version: u64,
+    direction: sdp::MediaDirection,
+) -> Result<(), u16> {
+    let offer = sdp::build_sdp(&sdp::LocalSdp {
+        ip: ctx.media_ip(),
+        rtp_port: media.local_port,
+        session_id: media.session_id,
+        version,
+        codecs: &[media.remote.codec],
+        dtmf_pt: media.remote.dtmf_pt,
+        direction,
+    });
+    let headers = vec![rsipstack::sip::Header::ContentType(
+        "application/sdp".into(),
+    )];
+    match dialog
+        .reinvite(Some(headers), Some(offer.into_bytes()))
+        .await
+    {
+        Ok(Some(response)) if response.status_code.kind() == StatusCodeKind::Successful => Ok(()),
+        Ok(Some(response)) => Err(response.status_code.code()),
+        Ok(None) | Err(_) => Err(0),
+    }
+}
+
+/// Asks the station to hand the call over to `target` (a blind transfer). Success means only that
+/// the request was accepted; the outcome follows in NOTIFY messages.
+async fn request_transfer(
+    ctx: &CallContext,
+    dialog: &InviteDialog,
+    target: &str,
+) -> Result<(), u16> {
+    let uri = ctx
+        .account
+        .callee_uri(target)
+        .parse::<rsipstack::sip::Uri>()
+        .map_err(|_| 0u16)?;
+    match dialog.refer(uri, None, None).await {
+        Ok(Some(response)) if response.status_code.kind() == StatusCodeKind::Successful => Ok(()),
+        Ok(Some(response)) => Err(response.status_code.code()),
+        Ok(None) | Err(_) => Err(0),
+    }
+}
+
+/// The status line of a transfer progress report: the body of the NOTIFY is a fragment of a SIP
+/// response such as `SIP/2.0 200 OK`.
+fn sipfrag_status(request: &rsipstack::sip::Request) -> Option<u16> {
+    let body = std::str::from_utf8(request.body()).ok()?;
+    let mut words = body.split_whitespace();
+    if !words.next()?.starts_with("SIP/2.0") {
+        return None;
+    }
+    words.next()?.parse().ok()
+}
+
+/// Answers a request the station sent inside the call: a new session description (hold, resume,
+/// refresh), a key press, a ping, a message. The stack waits for the answer and would otherwise
+/// reply "not implemented" after half a minute.
+async fn answer_in_dialog(
+    ctx: &CallContext,
+    state: DialogState,
+    media: &RunningMedia,
+    flags: &mut CallFlags,
+) {
+    use rsipstack::sip::StatusCode;
+    match state {
+        DialogState::Updated(_, request, handle) => {
+            let body = std::str::from_utf8(request.body()).unwrap_or_default();
+            if body.trim().is_empty() {
+                // A session refresh without a new description.
+                let _ = handle.reply(StatusCode::OK).await;
+                return;
+            }
+            match sdp::parse_remote(body) {
+                Ok(remote) => {
+                    let held = remote.on_hold();
+                    if flags.view.remote_hold != held {
+                        flags.view.remote_hold = held;
+                        flags.publish(ctx);
+                    }
+                    flags.sdp_version += 1;
+                    let answer = sdp::build_sdp(&sdp::LocalSdp {
+                        ip: ctx.media_ip(),
+                        rtp_port: media.local_port,
+                        session_id: media.session_id,
+                        version: flags.sdp_version,
+                        codecs: &[media.remote.codec],
+                        dtmf_pt: media.remote.dtmf_pt,
+                        direction: remote.direction.answer(),
+                    });
+                    let headers = vec![rsipstack::sip::Header::ContentType(
+                        "application/sdp".into(),
+                    )];
+                    let _ = handle
+                        .respond(StatusCode::OK, Some(headers), Some(answer.into_bytes()))
+                        .await;
+                }
+                Err(_) => {
+                    let _ = handle.reply(StatusCode::NotAcceptableHere).await;
+                }
+            }
+        }
+        DialogState::Info(_, _, handle)
+        | DialogState::Options(_, _, handle)
+        | DialogState::Message(_, _, handle) => {
+            let _ = handle.reply(StatusCode::OK).await;
+        }
+        // Being transferred by the other side is not supported yet: say so at once.
+        DialogState::Refer(_, _, handle) | DialogState::Publish(_, _, handle) => {
+            let _ = handle.reply(StatusCode::NotImplemented).await;
+        }
+        _ => {}
     }
 }
 
@@ -663,5 +949,222 @@ mod tests {
         // No common codec: better to fall back to our own ringback tone than to hear nothing.
         let sdp = "v=0\r\nc=IN IP4 203.0.113.9\r\nm=audio 20000 RTP/AVP 18\r\n";
         assert!(early_remote(&provisional("183 Session Progress", sdp)).is_none());
+    }
+
+    // ---- requests the station sends inside a call
+
+    use rsipstack::dialog::DialogId;
+    use rsipstack::dialog::dialog::{TransactionCommand, TransactionHandle};
+    use rsipstack::sip::StatusCode;
+
+    fn dialog_id() -> DialogId {
+        DialogId {
+            call_id: "call-1".into(),
+            local_tag: "local".into(),
+            remote_tag: "remote".into(),
+        }
+    }
+
+    fn request(method: &str, body: &str) -> rsipstack::sip::Request {
+        let raw = format!(
+            "{method} sip:300@10.0.0.5 SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK9\r\n\
+             From: <sip:100@x>;tag=remote\r\nTo: <sip:300@x>;tag=local\r\nCall-ID: call-1\r\n\
+             CSeq: 2 {method}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        rsipstack::sip::Request::try_from(raw.as_str()).expect("valid request")
+    }
+
+    /// A call context that is good enough to answer requests with. It has no network behind it.
+    fn context() -> (CallContext, std::sync::mpsc::Receiver<Event>) {
+        let endpoint = rsipstack::EndpointBuilder::new().build();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = CallContext {
+            dialog_layer: Arc::new(DialogLayer::new(endpoint.inner.clone())),
+            account: Arc::new(Account {
+                server: "pbx.example.com".into(),
+                extension: "300".into(),
+                password: "secret".into(),
+                connection: Default::default(),
+            }),
+            local_ip: "10.0.0.5".parse().unwrap(),
+            server_ips: Arc::new(vec!["10.0.0.2".parse().unwrap()]),
+            link: Arc::new(Mutex::new(None)),
+            audio: Arc::new(Mutex::new(AudioSettings::default())),
+            calls: Arc::new(Mutex::new(CallSettings::default())),
+            events: Events::new(tx, Arc::new(|| {})),
+            slot: Arc::new(CallSlot::default()),
+        };
+        (ctx, rx)
+    }
+
+    fn media() -> RunningMedia {
+        let (dtmf, _rx) = unbounded_channel();
+        RunningMedia {
+            stop: CancellationToken::new(),
+            task: None,
+            muted: Arc::new(AtomicBool::new(false)),
+            dtmf,
+            remote: sdp::Remote {
+                addr: "10.0.0.2:20000".parse().unwrap(),
+                codec: crate::g711::Codec::Pcma,
+                dtmf_pt: Some(101),
+                direction: sdp::MediaDirection::SendRecv,
+            },
+            local_port: 40000,
+            session_id: 77,
+        }
+    }
+
+    fn flags() -> CallFlags {
+        CallFlags {
+            user_muted: false,
+            view: CallView::new("100", Phase::Active),
+            sdp_version: 77,
+            transfer: None,
+        }
+    }
+
+    /// Feeds `state` to the call and returns what was answered, plus the new flags.
+    async fn answer(
+        make_state: impl FnOnce(TransactionHandle) -> DialogState,
+    ) -> (
+        Option<(StatusCode, Option<Vec<u8>>)>,
+        CallFlags,
+        std::sync::mpsc::Receiver<Event>,
+    ) {
+        let (ctx, events) = context();
+        let (handle, mut replies) = TransactionHandle::new();
+        let mut flags = flags();
+        answer_in_dialog(&ctx, make_state(handle), &media(), &mut flags).await;
+        let reply = replies.try_recv().ok().map(|command| match command {
+            TransactionCommand::Respond { status, body, .. } => (status, body),
+        });
+        (reply, flags, events)
+    }
+
+    #[tokio::test]
+    async fn a_hold_request_is_answered_recvonly_and_shown() {
+        let sdp = "v=0\r\nc=IN IP4 10.0.0.2\r\nm=audio 20000 RTP/AVP 8\r\na=sendonly\r\n";
+        let (reply, flags, events) =
+            answer(|h| DialogState::Updated(dialog_id(), request("INVITE", sdp), h)).await;
+        let (status, body) = reply.expect("the request is answered");
+        assert_eq!(status, StatusCode::OK);
+        let answer = String::from_utf8(body.expect("with a description")).unwrap();
+        assert!(answer.contains("a=recvonly"), "{answer}");
+        assert!(answer.contains("m=audio 40000"), "our own port: {answer}");
+        assert!(flags.view.remote_hold, "the screen is told");
+        assert!(matches!(events.try_recv(), Ok(Event::Call(Some(view))) if view.remote_hold));
+    }
+
+    #[tokio::test]
+    async fn resuming_clears_the_hold() {
+        let sdp = "v=0\r\nc=IN IP4 10.0.0.2\r\nm=audio 20000 RTP/AVP 8\r\na=sendrecv\r\n";
+        let (ctx, _events) = context();
+        let (handle, mut replies) = TransactionHandle::new();
+        let mut flags = flags();
+        flags.view.remote_hold = true;
+        let state = DialogState::Updated(dialog_id(), request("INVITE", sdp), handle);
+        answer_in_dialog(&ctx, state, &media(), &mut flags).await;
+        assert!(!flags.view.remote_hold);
+        assert!(replies.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_version_of_our_descriptions_keeps_growing() {
+        let sdp = "v=0\r\nc=IN IP4 10.0.0.2\r\nm=audio 20000 RTP/AVP 8\r\na=sendrecv\r\n";
+        let (reply, flags, _events) =
+            answer(|h| DialogState::Updated(dialog_id(), request("INVITE", sdp), h)).await;
+        let body = String::from_utf8(reply.unwrap().1.unwrap()).unwrap();
+        assert!(body.contains("o=rustphone 77 78 "), "{body}");
+        assert_eq!(flags.sdp_version, 78);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_without_a_description_gets_a_plain_ok() {
+        let (reply, _flags, _events) =
+            answer(|h| DialogState::Updated(dialog_id(), request("UPDATE", ""), h)).await;
+        assert_eq!(reply, Some((StatusCode::OK, None)));
+    }
+
+    #[tokio::test]
+    async fn an_unusable_description_is_refused() {
+        let sdp = "v=0\r\nc=IN IP4 10.0.0.2\r\nm=audio 20000 RTP/AVP 18\r\n";
+        let (reply, _flags, _events) =
+            answer(|h| DialogState::Updated(dialog_id(), request("INVITE", sdp), h)).await;
+        assert_eq!(reply.map(|r| r.0), Some(StatusCode::NotAcceptableHere));
+    }
+
+    #[tokio::test]
+    async fn info_options_and_messages_are_acknowledged() {
+        for method in ["INFO", "OPTIONS", "MESSAGE"] {
+            let (reply, _f, _e) = answer(|h| match method {
+                "INFO" => DialogState::Info(dialog_id(), request("INFO", ""), h),
+                "OPTIONS" => DialogState::Options(dialog_id(), request("OPTIONS", ""), h),
+                _ => DialogState::Message(dialog_id(), request("MESSAGE", "hi"), h),
+            })
+            .await;
+            assert_eq!(reply.map(|r| r.0), Some(StatusCode::OK), "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn being_transferred_by_the_other_side_is_declined_at_once() {
+        let (reply, _f, _e) =
+            answer(|h| DialogState::Refer(dialog_id(), request("REFER", ""), h)).await;
+        assert_eq!(reply.map(|r| r.0), Some(StatusCode::NotImplemented));
+    }
+
+    // ---- transfer progress and keypad tones
+
+    #[test]
+    fn transfer_progress_is_read_from_the_notify_body() {
+        let notify = |body: &str| request("NOTIFY", body);
+        assert_eq!(sipfrag_status(&notify("SIP/2.0 100 Trying\r\n")), Some(100));
+        assert_eq!(sipfrag_status(&notify("SIP/2.0 200 OK\r\n")), Some(200));
+        assert_eq!(sipfrag_status(&notify("SIP/2.0 486 Busy Here")), Some(486));
+        assert_eq!(sipfrag_status(&notify("hello")), None);
+        assert_eq!(sipfrag_status(&notify("")), None);
+    }
+
+    #[test]
+    fn a_confirmed_transfer_ends_the_call_and_a_refused_one_does_not() {
+        let (ctx, events) = context();
+        let mut f = flags();
+        f.transfer = Some(PendingTransfer {
+            target: "200".into(),
+            since: Instant::now(),
+        });
+        f.view.transferring = true;
+        assert!(f.transfer_progress(&ctx, 180).is_none(), "still trying");
+        assert!(f.transfer.is_some());
+        assert_eq!(
+            f.transfer_progress(&ctx, 200),
+            Some(Notice::Transferred("200".into()))
+        );
+
+        let mut f = flags();
+        f.transfer = Some(PendingTransfer {
+            target: "200".into(),
+            since: Instant::now(),
+        });
+        f.view.transferring = true;
+        assert!(f.transfer_progress(&ctx, 486).is_none());
+        assert!(
+            !f.view.transferring && f.transfer.is_none(),
+            "back to a normal call"
+        );
+        let toasts: Vec<_> = events.try_iter().collect();
+        assert!(
+            toasts
+                .iter()
+                .any(|e| matches!(e, Event::Toast(Notice::TransferFailed(486))))
+        );
+    }
+
+    #[test]
+    fn keypad_tones_for_info_use_the_dtmf_relay_format() {
+        assert_eq!(dtmf_relay_body('5'), "Signal=5\r\nDuration=160\r\n");
+        assert_eq!(dtmf_relay_body('#'), "Signal=#\r\nDuration=160\r\n");
     }
 }

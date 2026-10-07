@@ -128,6 +128,42 @@ pub struct AudioSettings {
     pub output_device: Option<String>,
 }
 
+/// How a key pressed during a call is sent to the other side.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DtmfMode {
+    /// As tones in the audio stream when the other side supports it, otherwise as SIP INFO.
+    #[default]
+    Auto,
+    /// Always as tones in the audio stream (RFC 4733).
+    Rfc4733,
+    /// Always as SIP INFO messages.
+    Info,
+}
+
+impl DtmfMode {
+    pub const ALL: [DtmfMode; 3] = [DtmfMode::Auto, DtmfMode::Rfc4733, DtmfMode::Info];
+
+    /// Whether to send this key as an audio tone, given whether the other side negotiated tones.
+    pub fn use_audio_tones(self, negotiated: bool) -> bool {
+        match self {
+            DtmfMode::Auto => negotiated,
+            DtmfMode::Rfc4733 => negotiated,
+            DtmfMode::Info => false,
+        }
+    }
+}
+
+/// How incoming and ongoing calls behave.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CallSettings {
+    /// Do not ring: incoming calls are turned away and appear as missed calls.
+    pub do_not_disturb: bool,
+    /// Answer incoming calls by itself after a moment.
+    pub auto_answer: bool,
+    pub dtmf_mode: DtmfMode,
+}
+
 /// Splits `host`, `host:port`, `[v6]` or `[v6]:port`. A bare IPv6 address (several colons, no
 /// brackets) is taken as a host without a port.
 pub fn split_host_port(text: &str) -> (String, Option<u16>) {
@@ -241,5 +277,20 @@ mod tests {
         assert_eq!(s.expiry_secs, DEFAULT_EXPIRY_SECS);
         assert!(s.use_public_address);
         assert_eq!(s.ws_path, "/");
+    }
+
+    #[test]
+    fn dtmf_modes_choose_between_tones_and_info() {
+        assert!(DtmfMode::Auto.use_audio_tones(true));
+        assert!(!DtmfMode::Auto.use_audio_tones(false), "falls back to INFO");
+        assert!(!DtmfMode::Info.use_audio_tones(true));
+        assert!(DtmfMode::Rfc4733.use_audio_tones(true));
+    }
+
+    #[test]
+    fn call_settings_default_to_a_normal_phone() {
+        let s: CallSettings = serde_json::from_str("{}").unwrap();
+        assert!(!s.do_not_disturb && !s.auto_answer);
+        assert_eq!(s.dtmf_mode, DtmfMode::Auto);
     }
 }

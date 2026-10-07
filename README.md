@@ -47,7 +47,8 @@ Sign in to your PBX, dial a number, answer calls — on macOS, Windows and Linux
 - **Choose your microphone and speaker** in **Settings → Audio**; the ringtone follows the speaker.
 - **Hear the call ring.** You get a ringback tone while the other phone rings, and the station's own tones or music when it sends them before the answer (early media).
 - **Recent calls** — incoming, outgoing and missed, one click to call back.
-- **In-call controls** — mute, keypad tones (DTMF) for voice menus, hang up.
+- **In-call controls** — mute, **hold and resume**, **transfer** the call to another number, keypad tones (DTMF) for voice menus, hang up. If the other side puts you on hold, the screen says so and the phone answers the station correctly.
+- **Call options:** **Do not disturb** (incoming calls are turned away and listed as missed), **auto-answer**, and a choice of how keypad tones are sent (as audio, as SIP INFO, or automatic).
 - **Ringtone** that plays on every platform, with nothing extra to install.
 - **Runs in the background.** Closing the window does not quit the app, so the phone stays registered and can still ring. On macOS the window simply goes away, as in any Mac app, and a click on the Dock icon brings it back; on Windows it goes to the system tray (click the tray icon to bring it back, right-click for the menu); on Linux it is minimized to the taskbar. An incoming call restores the window, raises it above other windows, gives it focus and bounces the Dock icon / flashes the taskbar button.
 - **Two interface languages:** **English** (the default) and **Russian**. Pick it from a drop-down list on the sign-in screen or in the top bar at any time; the choice is remembered.
@@ -244,7 +245,7 @@ Your account, call history and language choice live in:
 - **Fixed-size window:** it cannot be resized or maximized.
 - **Transport:** UDP, TCP, TLS, WS and WSS. Audio is IPv4-only, so the phone prefers IPv4 addresses of a station. TLS trusts the operating system's certificates plus an optional extra file; a self-signed station certificate must be added there. WSS trusts the system's certificates only.
 - **Audio:** G.711 (PCMU/PCMA) only. Calls are **not encrypted** (no SRTP); use a trusted network or a VPN.
-- **Not supported yet:** hold, transfer, video.
+- **Not supported yet:** attended transfer, being transferred by the other side, several calls at once, conferences and video.
 - **NAT:** works when the PBX is on your network or reachable publicly. If you are behind NAT and the other side hears nothing, check that your router does not block UDP media from the PBX.
 - **Safety:** the phone only accepts incoming calls from the server you signed in to, and only accepts audio from the addresses negotiated for the call.
 - Developed mainly on macOS; Windows and Linux builds come from CI. Please [open an issue](https://github.com/DjTim0n/RustSIPPhone/issues) if something misbehaves there.

@@ -3,7 +3,7 @@
 use crate::call::{self, CallContext, CallCtl, CallSlot, LinkInfo, SharedLink};
 use crate::model::*;
 use crate::net;
-use crate::settings::{AudioSettings, TransportKind, split_host_port};
+use crate::settings::{AudioSettings, CallSettings, TransportKind, split_host_port};
 use rsipstack::dialog::authenticate::Credential;
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::registration::Registration;
@@ -28,6 +28,7 @@ fn refresh_interval(expiry: u32) -> Duration {
 pub async fn run(mut commands: UnboundedReceiver<Command>, events: Events) {
     let slot = Arc::new(CallSlot::default());
     let audio = Arc::new(Mutex::new(AudioSettings::default()));
+    let calls = Arc::new(Mutex::new(CallSettings::default()));
     let mut session: Option<Session> = None;
 
     while let Some(command) = commands.recv().await {
@@ -37,7 +38,15 @@ pub async fn run(mut commands: UnboundedReceiver<Command>, events: Events) {
                     old.stop().await;
                 }
                 events.send(Event::Reg(RegState::Connecting));
-                match Session::start(account, events.clone(), slot.clone(), audio.clone()).await {
+                match Session::start(
+                    account,
+                    events.clone(),
+                    slot.clone(),
+                    audio.clone(),
+                    calls.clone(),
+                )
+                .await
+                {
                     Ok(new) => session = Some(new),
                     Err(notice) => events.send(Event::Reg(RegState::Failed {
                         notice,
@@ -63,6 +72,11 @@ pub async fn run(mut commands: UnboundedReceiver<Command>, events: Events) {
             Command::SetAudio(settings) => {
                 *audio.lock().unwrap_or_else(|e| e.into_inner()) = settings
             }
+            Command::SetCalls(settings) => {
+                *calls.lock().unwrap_or_else(|e| e.into_inner()) = settings
+            }
+            Command::Hold(on) => slot.send(CallCtl::Hold(on)),
+            Command::Transfer(target) => slot.send(CallCtl::Transfer(target)),
             Command::Answer => slot.send(CallCtl::Answer),
             Command::Reject => slot.send(CallCtl::Reject),
             Command::Hangup => slot.send(CallCtl::Hangup),
@@ -99,6 +113,7 @@ impl Session {
         events: Events,
         slot: Arc<CallSlot>,
         audio: Arc<Mutex<AudioSettings>>,
+        calls: Arc<Mutex<CallSettings>>,
     ) -> Result<Session, Notice> {
         let transport = account.connection.transport;
         let (host, port) = account.server_host_port();
@@ -132,6 +147,7 @@ impl Session {
             server_ips: Arc::new(server_ips),
             link: link.clone(),
             audio,
+            calls,
             events: events.clone(),
             slot,
         };
@@ -777,6 +793,7 @@ mod registration_tests {
             events,
             Arc::new(CallSlot::default()),
             Arc::new(Mutex::new(AudioSettings::default())),
+            Arc::new(Mutex::new(CallSettings::default())),
         )
         .await
         .expect("the session starts");
@@ -917,6 +934,7 @@ mod registration_tests {
             events,
             Arc::new(CallSlot::default()),
             Arc::new(Mutex::new(AudioSettings::default())),
+            Arc::new(Mutex::new(CallSettings::default())),
         )
         .await;
         assert!(matches!(

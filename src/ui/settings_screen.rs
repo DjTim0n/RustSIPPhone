@@ -3,7 +3,8 @@
 use super::*;
 use crate::audio::{self, AudioDevices};
 use crate::settings::{
-    AudioSettings, ConnectionSettings, MAX_EXPIRY_SECS, MIN_EXPIRY_SECS, TransportKind,
+    AudioSettings, CallSettings, ConnectionSettings, DtmfMode, MAX_EXPIRY_SECS, MIN_EXPIRY_SECS,
+    TransportKind,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,7 @@ pub(super) struct SettingsDraft {
     pub password: String,
     pub connection: ConnectionSettings,
     pub audio: AudioSettings,
+    pub calls: CallSettings,
     /// The user tried to save without the station address or extension.
     pub missing: bool,
 }
@@ -70,6 +72,14 @@ fn transport_label(transport: TransportKind, l: Lang) -> String {
         TransportKind::Tls => format!("TLS ({})", l.t("encrypted", "шифрование")),
         TransportKind::Ws => "WebSocket (WS)".into(),
         TransportKind::Wss => format!("WebSocket (WSS, {})", l.t("encrypted", "шифрование")),
+    }
+}
+
+fn dtmf_label(mode: DtmfMode, l: Lang) -> &'static str {
+    match mode {
+        DtmfMode::Auto => l.t("Automatic", "Автоматически"),
+        DtmfMode::Rfc4733 => l.t("In the audio (RFC 4733)", "В звуке (RFC 4733)"),
+        DtmfMode::Info => l.t("SIP INFO messages", "Сообщения SIP INFO"),
     }
 }
 
@@ -108,6 +118,7 @@ impl PhoneApp {
             password: String::new(),
             connection: self.stored.connection.clone(),
             audio: self.stored.audio.clone(),
+            calls: self.stored.calls.clone(),
             missing: false,
         });
     }
@@ -141,10 +152,12 @@ impl PhoneApp {
         self.stored.extension = extension.clone();
         self.stored.connection = connection.clone();
         self.stored.audio = draft.audio.clone();
+        self.stored.calls = draft.calls.clone();
         store::save(&self.stored);
         self.form.server = server.clone();
         self.form.extension = extension.clone();
         self.send(Command::SetAudio(draft.audio));
+        self.send(Command::SetCalls(draft.calls));
 
         if self.signed_in && account_changed {
             let password = if draft.password.is_empty() {
@@ -249,7 +262,7 @@ impl PhoneApp {
                 }
                 SettingsTab::Network => self.network_tab(ui, &mut draft, l),
                 SettingsTab::Audio => self.audio_tab(ui, &mut draft, l),
-                SettingsTab::General => language = self.general_tab(ui, l),
+                SettingsTab::General => language = self.general_tab(ui, &mut draft, l),
             });
 
         ui.add_space(8.0);
@@ -501,7 +514,7 @@ impl PhoneApp {
     }
 
     /// Returns the language if the user changed it.
-    fn general_tab(&self, ui: &mut Ui, l: Lang) -> Option<Lang> {
+    fn general_tab(&self, ui: &mut Ui, draft: &mut SettingsDraft, l: Lang) -> Option<Lang> {
         let mut chosen_language = None;
         label(ui, l.t("Language", "Язык"));
         let options: Vec<String> = Lang::ALL
@@ -512,7 +525,48 @@ impl PhoneApp {
         if let Some(chosen) = dropdown(ui, "language_setting", &options, selected) {
             chosen_language = Some(Lang::ALL[chosen]);
         }
-        ui.add_space(20.0);
+        ui.add_space(18.0);
+
+        label(ui, l.t("Calls", "Звонки"));
+        toggle_row(
+            ui,
+            l.t("Do not disturb", "Не беспокоить"),
+            l.t(
+                "Incoming calls are turned away and show up as missed.",
+                "Входящие отклоняются и попадают в пропущенные.",
+            ),
+            &mut draft.calls.do_not_disturb,
+        );
+        toggle_row(
+            ui,
+            l.t("Answer automatically", "Отвечать автоматически"),
+            l.t(
+                "Picks up after a moment. Handy for a headset or an intercom.",
+                "Снимает трубку через мгновение. Удобно для гарнитуры или селектора.",
+            ),
+            &mut draft.calls.auto_answer,
+        );
+        ui.add_space(4.0);
+        label(ui, l.t("Keypad tones", "Тоны клавиш"));
+        let options: Vec<String> = DtmfMode::ALL
+            .iter()
+            .map(|m| dtmf_label(*m, l).into())
+            .collect();
+        let selected = DtmfMode::ALL
+            .iter()
+            .position(|m| *m == draft.calls.dtmf_mode)
+            .unwrap_or(0);
+        if let Some(chosen) = dropdown(ui, "dtmf", &options, selected) {
+            draft.calls.dtmf_mode = DtmfMode::ALL[chosen];
+        }
+        hint(
+            ui,
+            l.t(
+                "How keys pressed during a call reach voice menus. Automatic uses what the station supports.",
+                "Как нажатия клавиш во время звонка доходят до голосового меню. Автоматический режим использует то, что поддерживает станция.",
+            ),
+        );
+        ui.add_space(18.0);
 
         egui::Frame::new()
             .fill(SURFACE)
@@ -1039,6 +1093,52 @@ mod tests {
         ];
 
         let mut screens = screens;
+        let active = |app: &mut PhoneApp, tweak: &dyn Fn(&mut CallView)| {
+            app.signed_in = true;
+            app.reg = RegState::Online;
+            let mut view = CallView {
+                connected_at: Some(Instant::now() - Duration::from_secs(42)),
+                ..CallView::new("7777", Phase::Active)
+            };
+            tweak(&mut view);
+            app.call = Some(view);
+        };
+        screens.push(("call-active", Box::new(move |app| active(app, &|_| {}))));
+        screens.push((
+            "call-keypad",
+            Box::new(move |app| {
+                active(app, &|_| {});
+                app.keypad_open = true;
+            }),
+        ));
+        screens.push((
+            "call-hold",
+            Box::new(move |app| active(app, &|v| v.local_hold = true)),
+        ));
+        screens.push((
+            "call-remote-hold",
+            Box::new(move |app| active(app, &|v| v.remote_hold = true)),
+        ));
+        screens.push((
+            "call-transfer",
+            Box::new(move |app| {
+                active(app, &|_| {});
+                app.transfer_open = true;
+            }),
+        ));
+        screens.push((
+            "call-transferring",
+            Box::new(move |app| active(app, &|v| v.transferring = true)),
+        ));
+        screens.push((
+            "phone-dnd",
+            Box::new(|app| {
+                app.signed_in = true;
+                app.reg = RegState::Online;
+                app.stored.extension = "888".into();
+                app.stored.calls.do_not_disturb = true;
+            }),
+        ));
         screens.push((
             "settings-network-tall",
             Box::new(|app| {

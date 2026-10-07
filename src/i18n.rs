@@ -207,6 +207,29 @@ impl Notice {
                     "Не удалось прочитать файл сертификата"
                 )
             ),
+            Notice::HoldFailed(code) => format!(
+                "{} ({} {code})",
+                lang.t(
+                    "The station wouldn't put the call on hold",
+                    "Станция не поставила звонок на удержание"
+                ),
+                lang.t("code", "код")
+            ),
+            Notice::TransferFailed(code) => format!(
+                "{} ({} {code})",
+                lang.t("The transfer was refused", "Перевод звонка отклонён"),
+                lang.t("code", "код")
+            ),
+            Notice::TransferUnconfirmed => lang
+                .t(
+                    "The transfer was requested, but the station didn't confirm it",
+                    "Перевод запрошен, но станция его не подтвердила",
+                )
+                .into(),
+            Notice::Transferred(target) => format!(
+                "{} {target}",
+                lang.t("Call transferred to", "Звонок переведён на")
+            ),
             Notice::PasswordNotSaved => lang
                 .t(
                     "Password not saved: this system has no password store. You'll need to enter it next time",
@@ -255,6 +278,10 @@ mod tests {
             Notice::PeerEndedCall,
             Notice::NoAudioReceived,
             Notice::PasswordNotSaved,
+            Notice::HoldFailed(488),
+            Notice::TransferFailed(403),
+            Notice::TransferUnconfirmed,
+            Notice::Transferred("200".into()),
             Notice::ConnectionFailed("refused".into()),
             Notice::TlsProblem("unknown issuer".into()),
             Notice::CertificateFileUnreadable("/tmp/ca.pem".into()),
