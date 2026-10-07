@@ -13,6 +13,7 @@ mod ringtone;
 mod rtp;
 mod sdp;
 mod store;
+mod tray;
 mod ui;
 mod window;
 

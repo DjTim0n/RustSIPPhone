@@ -5,7 +5,9 @@
 //!
 //! * macOS: the window just goes away, as in any Mac app, while the app keeps running; clicking
 //!   its Dock icon brings it back.
-//! * Windows and Linux: the window is minimized, so the taskbar button stays as the way back in.
+//! * Windows: the window is hidden to the system tray (see `tray.rs`); the tray icon brings it back.
+//! * Linux (and Windows if the tray icon could not be created): the window is minimized, so the
+//!   taskbar button stays as the way back in.
 
 use eframe::egui::{UserAttentionType, ViewportCommand, WindowLevel};
 
@@ -14,20 +16,35 @@ pub const WINDOW_SIZE: [f32; 2] = [400.0, 720.0];
 
 /// What to do when the user asks to close the window.
 ///
-/// Normally the request is cancelled so the phone keeps running; on Windows and Linux the window
-/// is also minimized (on macOS [`hide_application`] takes it out of sight). When the user chose
-/// to quit, the request goes through and the app exits.
-pub fn close_request_commands(quitting: bool) -> Vec<ViewportCommand> {
+/// Normally the request is cancelled so the phone keeps running. On macOS [`hide_application`]
+/// takes the window out of sight; with a tray icon the window is hidden (the icon is the way
+/// back); otherwise it is minimized. When the user chose to quit, the request goes through and
+/// the app exits.
+pub fn close_request_commands(quitting: bool, has_tray: bool) -> Vec<ViewportCommand> {
     if quitting {
         Vec::new()
     } else if cfg!(target_os = "macos") {
         vec![ViewportCommand::CancelClose]
+    } else if has_tray {
+        vec![
+            ViewportCommand::CancelClose,
+            ViewportCommand::Visible(false),
+        ]
     } else {
         vec![
             ViewportCommand::CancelClose,
             ViewportCommand::Minimized(true),
         ]
     }
+}
+
+/// Bring the window back on request (a click on the tray icon or its menu).
+pub fn show_window_commands() -> Vec<ViewportCommand> {
+    vec![
+        ViewportCommand::Visible(true),
+        ViewportCommand::Minimized(false),
+        ViewportCommand::Focus,
+    ]
 }
 
 /// Hides the application the way Cmd+H does: the window disappears, the app keeps running, and a
@@ -72,19 +89,39 @@ mod tests {
 
     #[test]
     fn closing_the_window_never_quits() {
-        let commands = close_request_commands(false);
-        assert!(commands.contains(&ViewportCommand::CancelClose));
+        for has_tray in [false, true] {
+            let commands = close_request_commands(false, has_tray);
+            assert!(commands.contains(&ViewportCommand::CancelClose));
+        }
     }
 
     #[test]
-    fn only_windows_and_linux_minimize_on_close() {
-        let minimizes = close_request_commands(false).contains(&ViewportCommand::Minimized(true));
+    fn without_a_tray_the_window_is_minimized_except_on_macos() {
+        let minimizes =
+            close_request_commands(false, false).contains(&ViewportCommand::Minimized(true));
         assert_eq!(minimizes, !cfg!(target_os = "macos"));
     }
 
     #[test]
+    fn with_a_tray_the_window_is_hidden_except_on_macos() {
+        let hides = close_request_commands(false, true).contains(&ViewportCommand::Visible(false));
+        assert_eq!(hides, !cfg!(target_os = "macos"));
+        // Hidden, not also minimized: the tray icon is the way back.
+        assert!(!close_request_commands(false, true).contains(&ViewportCommand::Minimized(true)));
+    }
+
+    #[test]
+    fn the_tray_can_bring_the_window_back() {
+        let commands = show_window_commands();
+        assert!(commands.contains(&ViewportCommand::Visible(true)));
+        assert!(commands.contains(&ViewportCommand::Minimized(false)));
+        assert!(commands.contains(&ViewportCommand::Focus));
+    }
+
+    #[test]
     fn quitting_lets_the_close_request_through() {
-        assert!(close_request_commands(true).is_empty());
+        assert!(close_request_commands(true, true).is_empty());
+        assert!(close_request_commands(true, false).is_empty());
     }
 
     #[test]

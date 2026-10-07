@@ -3,6 +3,7 @@
 use crate::i18n::Lang;
 use crate::model::*;
 use crate::store::{self, Stored};
+use crate::tray::{Tray, TrayAction};
 use crate::window;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke,
@@ -64,6 +65,8 @@ pub struct PhoneApp {
     quitting: bool,
     /// The window was sent to the background and has not been brought back yet.
     in_background: bool,
+    /// System tray icon (Windows). `None` where there is no tray, or if creating it failed.
+    tray: Option<Tray>,
 }
 
 impl PhoneApp {
@@ -81,6 +84,7 @@ impl PhoneApp {
         let engine = runtime.spawn(crate::engine::run(command_rx, events));
 
         let stored = store::load();
+        let tray = Tray::new(&cc.egui_ctx, stored.language);
         let mut app = PhoneApp {
             runtime,
             engine: Some(engine),
@@ -102,6 +106,7 @@ impl PhoneApp {
             toast: None,
             quitting: false,
             in_background: false,
+            tray,
         };
         app.try_auto_login();
         app
@@ -254,6 +259,9 @@ impl PhoneApp {
         if self.stored.language != lang {
             self.stored.language = lang;
             store::save(&self.stored);
+            if let Some(tray) = &self.tray {
+                tray.set_language(lang);
+            }
         }
     }
 }
@@ -264,8 +272,23 @@ impl eframe::App for PhoneApp {
     /// an incoming call has to bring the window back even when nothing is on screen.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events(ctx);
+        // Clicks on the tray icon and its menu.
+        let tray_actions = self.tray.as_ref().map(Tray::actions).unwrap_or_default();
+        for action in tray_actions {
+            match action {
+                TrayAction::Show => {
+                    for command in window::show_window_commands() {
+                        ctx.send_viewport_cmd(command);
+                    }
+                }
+                TrayAction::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
-            for command in window::close_request_commands(self.quitting) {
+            for command in window::close_request_commands(self.quitting, self.tray.is_some()) {
                 ctx.send_viewport_cmd(command);
             }
             window::hide_application();
