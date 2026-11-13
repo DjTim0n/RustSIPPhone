@@ -288,7 +288,14 @@ struct Pinned {
     source: SocketAddr,
     ssrc: u32,
     last_sequence: u16,
+    /// When its last packet arrived, on the clock `check` is given.
+    last_seen: Duration,
 }
+
+/// How long the stream the call listens to must have been silent before another one from the
+/// same address may replace it. A burst of forged packets squeezed in between two real ones
+/// (20 ms apart) therefore cannot take the call over.
+const STREAM_QUIET: Duration = Duration::from_millis(300);
 
 /// A packet this far behind the newest one is late or repeated and is skipped; one further
 /// behind means the sender started counting anew.
@@ -359,11 +366,12 @@ impl PeerFilter {
         self.candidate = None;
     }
 
-    fn pin(&mut self, source: SocketAddr, header: &RtpHeader) {
+    fn pin(&mut self, source: SocketAddr, header: &RtpHeader, now: Duration) {
         self.pinned = Some(Pinned {
             source,
             ssrc: header.ssrc,
             last_sequence: header.sequence,
+            last_seen: now,
         });
         self.candidate = None;
     }
@@ -376,6 +384,7 @@ impl PeerFilter {
             if header.ssrc == pinned.ssrc {
                 // The stream we listen to is alive: nothing else gets to replace it.
                 self.candidate = None;
+                pinned.last_seen = elapsed;
                 let ahead = header.sequence.wrapping_sub(pinned.last_sequence) as i16;
                 if ahead <= 0 && ahead > -MAX_LATE_PACKETS {
                     return Verdict::Drop;
@@ -383,14 +392,18 @@ impl PeerFilter {
                 pinned.last_sequence = header.sequence;
                 return Verdict::Accept { latch: false };
             }
+            if elapsed.saturating_sub(pinned.last_seen) < STREAM_QUIET {
+                self.candidate = None;
+                return Verdict::Drop;
+            }
             if streak(&mut self.candidate, source, header) >= NAT_LEARN_PACKETS {
-                self.pin(source, header);
+                self.pin(source, header, elapsed);
                 return Verdict::Accept { latch: false };
             }
             return Verdict::Drop;
         }
         if self.trusted.contains(&source.ip()) {
-            self.pin(source, header);
+            self.pin(source, header, elapsed);
             return Verdict::Accept { latch: true };
         }
         if !self.allow_nat_learning || elapsed > NAT_LEARN_WINDOW {
@@ -398,7 +411,7 @@ impl PeerFilter {
         }
         if streak(&mut self.candidate, source, header) >= NAT_LEARN_PACKETS {
             self.trusted.push(source.ip());
-            self.pin(source, header);
+            self.pin(source, header, elapsed);
             return Verdict::Accept { latch: true };
         }
         Verdict::Drop
@@ -526,6 +539,27 @@ mod tests {
             f.check(src, &header(7, 101), t),
             Verdict::Drop,
             "the old one"
+        );
+    }
+
+    /// Forged packets sent in one go, right after a real one, must not take the call over
+    /// however many of them there are.
+    #[test]
+    fn a_burst_cannot_replace_a_stream_that_was_just_heard() {
+        let mut f = pinned_filter();
+        let src = addr("203.0.113.5:4000");
+        let t = Duration::from_secs(60);
+        assert_eq!(
+            f.check(src, &header(7, 101), t),
+            Verdict::Accept { latch: false }
+        );
+        for seq in 500..600 {
+            let soon = t + Duration::from_millis(19);
+            assert_eq!(f.check(src, &header(8, seq), soon), Verdict::Drop);
+        }
+        assert_eq!(
+            f.check(src, &header(7, 102), t + Duration::from_millis(20)),
+            Verdict::Accept { latch: false }
         );
     }
 
