@@ -693,7 +693,7 @@ impl PhoneApp {
                 .frame(egui::Frame::NONE)
                 .margin(vec2(0.0, 10.0)),
         );
-        self.number.retain(|c| "0123456789*#+".contains(c));
+        self.number.retain(is_dialable);
         display.request_focus();
         let enter = display.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
 
@@ -827,6 +827,12 @@ impl PhoneApp {
     }
 }
 
+/// What may be typed into the number field: a number, or a full address such as
+/// `bob@example.com` (callers without a number appear like that in the history, too).
+fn is_dialable(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "*#+@.-_:".contains(c)
+}
+
 fn history_kind(entry: &HistoryEntry, l: Lang) -> (Color32, &'static str) {
     match (entry.direction, entry.outcome) {
         (Direction::Incoming, Outcome::Missed) => (RED, l.t("Missed", "Пропущенный")),
@@ -885,6 +891,9 @@ impl PhoneApp {
         };
         let l = self.lang();
 
+        // What went wrong during the call (hold or transfer refused) has to be seen here: the
+        // main screen, where notices otherwise appear, is hidden until the call ends.
+        self.toast_banner(ui);
         ui.add_space(28.0);
         let avatar = ui.allocate_space(vec2(ui.available_width(), 92.0)).1;
         draw_avatar(ui, avatar.center(), 44.0);
@@ -1017,10 +1026,10 @@ impl PhoneApp {
                 }
                 ui.add_space(12.0);
                 if self.keypad_open {
-                    if let Some(key) = keypad(ui, &DIAL_KEYS, 54.0, 10.0) {
-                        if let Some(digit) = key.chars().next() {
-                            self.send(Command::Dtmf(digit));
-                        }
+                    if let Some(key) = keypad(ui, &DIAL_KEYS, 54.0, 10.0)
+                        && let Some(digit) = key.chars().next()
+                    {
+                        self.send(Command::Dtmf(digit));
                     }
                     ui.add_space(10.0);
                 }

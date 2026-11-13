@@ -134,7 +134,8 @@ pub enum DtmfMode {
     /// As tones in the audio stream when the other side supports it, otherwise as SIP INFO.
     #[default]
     Auto,
-    /// Always as tones in the audio stream (RFC 4733).
+    /// Always as tones in the audio stream (RFC 4733), even if the other side did not say it
+    /// understands them.
     Rfc4733,
     /// Always as SIP INFO messages.
     Info,
@@ -147,7 +148,7 @@ impl DtmfMode {
     pub fn use_audio_tones(self, negotiated: bool) -> bool {
         match self {
             DtmfMode::Auto => negotiated,
-            DtmfMode::Rfc4733 => negotiated,
+            DtmfMode::Rfc4733 => true,
             DtmfMode::Info => false,
         }
     }
@@ -263,8 +264,10 @@ mod tests {
 
     #[test]
     fn expiry_is_clamped() {
-        let mut s = ConnectionSettings::default();
-        s.expiry_secs = 5;
+        let mut s = ConnectionSettings {
+            expiry_secs: 5,
+            ..Default::default()
+        };
         assert_eq!(s.expiry(), MIN_EXPIRY_SECS);
         s.expiry_secs = 99_999;
         assert_eq!(s.expiry(), MAX_EXPIRY_SECS);
@@ -285,6 +288,10 @@ mod tests {
         assert!(!DtmfMode::Auto.use_audio_tones(false), "falls back to INFO");
         assert!(!DtmfMode::Info.use_audio_tones(true));
         assert!(DtmfMode::Rfc4733.use_audio_tones(true));
+        assert!(
+            DtmfMode::Rfc4733.use_audio_tones(false),
+            "always means always"
+        );
     }
 
     #[test]

@@ -15,6 +15,14 @@ pub const SAMPLE_RATE: u32 = 8000;
 const PREBUFFER_MS: usize = 60;
 /// Maximum playback queue delay; anything beyond it is dropped.
 const MAX_QUEUE_MS: usize = 400;
+/// How much delay above the pre-buffer is tolerated before the queue is trimmed back.
+const DELAY_SLACK_MS: usize = 40;
+/// Over how many pushes (packets, 20 ms each) the delay is watched before trimming.
+const DELAY_WINDOW_PUSHES: u32 = 100;
+
+const fn samples(ms: usize) -> usize {
+    ms * SAMPLE_RATE as usize / 1000
+}
 
 pub type SpeakerQueue = Arc<Mutex<Playback>>;
 
@@ -81,21 +89,46 @@ impl Drop for AudioIo {
 pub struct Playback {
     queue: VecDeque<i16>,
     started: bool,
+    /// The emptiest the queue has been, just before a packet arrived, in the current window.
+    low_water: Option<usize>,
+    pushes: u32,
 }
 
 impl Playback {
-    pub fn push(&mut self, samples: &[i16]) {
-        self.queue.extend(samples.iter().copied());
-        let max = MAX_QUEUE_MS * SAMPLE_RATE as usize / 1000;
+    pub fn push(&mut self, packet: &[i16]) {
+        self.trim_delay();
+        self.queue.extend(packet.iter().copied());
+        let max = samples(MAX_QUEUE_MS);
         if self.queue.len() > max {
             let excess = self.queue.len() - max;
             self.queue.drain(..excess);
         }
     }
 
+    /// Keeps the other side's voice from falling behind. After a burst of packets (a network
+    /// hiccup) or when the sender's clock runs a little fast, the queue stays longer than it
+    /// needs to be, and that is delay the listener hears for the rest of the call. If the queue
+    /// never got near empty for a couple of seconds, the surplus is dropped.
+    fn trim_delay(&mut self) {
+        if !self.started {
+            return;
+        }
+        let level = self.queue.len();
+        self.low_water = Some(self.low_water.map_or(level, |low| low.min(level)));
+        self.pushes += 1;
+        if self.pushes < DELAY_WINDOW_PUSHES {
+            return;
+        }
+        let low = self.low_water.take().unwrap_or(0);
+        self.pushes = 0;
+        if low > samples(PREBUFFER_MS + DELAY_SLACK_MS) {
+            self.queue.drain(..low - samples(PREBUFFER_MS));
+        }
+    }
+
     fn pop(&mut self) -> Option<i16> {
         if !self.started {
-            if self.queue.len() < PREBUFFER_MS * SAMPLE_RATE as usize / 1000 {
+            if self.queue.len() < samples(PREBUFFER_MS) {
                 return None;
             }
             self.started = true;
@@ -104,6 +137,8 @@ impl Playback {
         if sample.is_none() {
             // The queue ran dry: build up a small reserve again so playback does not stutter.
             self.started = false;
+            self.low_water = None;
+            self.pushes = 0;
         }
         sample
     }
@@ -396,6 +431,38 @@ mod tests {
         assert_eq!(p.pop(), None); // still building up the reserve
         p.push(&[1; 400]);
         assert_eq!(p.pop(), Some(1));
+    }
+
+    /// Plays `packets` packets of 20 ms at the pace they arrive and returns the delay left.
+    fn play_steadily(p: &mut Playback, packets: usize) -> usize {
+        for _ in 0..packets {
+            p.push(&[1; 160]);
+            for _ in 0..160 {
+                p.pop();
+            }
+        }
+        p.queue.len()
+    }
+
+    #[test]
+    fn delay_left_by_a_burst_is_trimmed_back() {
+        let mut p = Playback::default();
+        p.push(&[1; 480]);
+        assert_eq!(p.pop(), Some(1), "playback has started");
+        // A burst: 300 ms arrive at once and would stay in the queue for the whole call.
+        p.push(&[1; 2400]);
+        let delay = play_steadily(&mut p, 2 * DELAY_WINDOW_PUSHES as usize);
+        assert!(delay <= samples(PREBUFFER_MS + DELAY_SLACK_MS), "{delay}");
+        assert!(delay >= samples(PREBUFFER_MS) - 160, "not emptied: {delay}");
+    }
+
+    #[test]
+    fn a_normal_delay_is_left_alone() {
+        let mut p = Playback::default();
+        p.push(&[1; 640]);
+        assert_eq!(p.pop(), Some(1));
+        let before = p.queue.len();
+        assert_eq!(play_steadily(&mut p, 300), before);
     }
 
     #[test]

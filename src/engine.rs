@@ -13,7 +13,7 @@ use rsipstack::transport::SipAddr;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -25,43 +25,210 @@ fn refresh_interval(expiry: u32) -> Duration {
     Duration::from_secs((u64::from(expiry) * 2 / 3).clamp(10, 3000))
 }
 
+/// What a session reports about itself to the core.
+#[derive(Debug)]
+enum SessionSignal {
+    /// Registration keeps failing. The network may have changed (another Wi-Fi, a VPN), so the
+    /// session should be built again with a fresh socket and freshly resolved addresses.
+    Rebuild(u64),
+    /// Registration was refused for good; there is nothing left to keep running.
+    GaveUp(u64),
+}
+
+/// What every session and call shares with the core.
+#[derive(Clone)]
+struct Shared {
+    events: Events,
+    slot: Arc<CallSlot>,
+    audio: Arc<Mutex<AudioSettings>>,
+    calls: Arc<Mutex<CallSettings>>,
+    signals: UnboundedSender<SessionSignal>,
+}
+
+/// How many registration attempts in a row may fail before the session is built again.
+const REBUILD_AFTER_FAILURES: u32 = 3;
+
+/// Gives a call that was just told to hang up a moment to say goodbye to the station.
+async fn wait_until_idle(slot: &CallSlot) {
+    for _ in 0..30 {
+        if !slot.is_busy() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The result of moving to another session: the new session, why it could not be started, or
+/// `None` when the phone was only asked to go offline.
+type Change = Option<Result<Session, Notice>>;
+
+/// Keeps the phone on the account it should be on.
+///
+/// Stopping a session and starting one can take seconds (DNS, a TLS handshake, the goodbye to the
+/// station), so that work runs as a task of its own and the core stays free to act on "hang up"
+/// or "quit" in the meantime.
+struct Core {
+    shared: Shared,
+    session: Option<Session>,
+    /// The account to be registered with; `None` when the phone should be offline.
+    wanted: Option<Account>,
+    /// The switch to another session that is under way.
+    change: Option<JoinHandle<Change>>,
+    /// `wanted` changed while a switch was under way: switch again when it is done.
+    stale: bool,
+    /// Report "offline" once the current session is gone (the user signed out).
+    announce_offline: bool,
+    /// When to try starting the session again after a failure that waiting may cure.
+    retry_at: Option<tokio::time::Instant>,
+    last_id: u64,
+}
+
+impl Core {
+    /// Starts moving from the current session to the one for `wanted`.
+    fn begin_change(&mut self) {
+        let old = self.session.take();
+        let target = self.wanted.clone();
+        let shared = self.shared.clone();
+        self.last_id += 1;
+        let id = self.last_id;
+        self.retry_at = None;
+        self.change = Some(tokio::spawn(async move {
+            if let Some(old) = old {
+                wait_until_idle(&shared.slot).await;
+                old.stop().await;
+            }
+            match target {
+                Some(account) => Some(Session::start(id, account, shared).await),
+                None => None,
+            }
+        }));
+    }
+
+    fn request_change(&mut self) {
+        if self.change.is_some() {
+            self.stale = true;
+        } else {
+            self.begin_change();
+        }
+    }
+
+    fn change_finished(&mut self, result: Result<Change, tokio::task::JoinError>) {
+        self.change = None;
+        let outcome = result.unwrap_or_else(|e| Some(Err(Notice::PhoneStartFailed(e.to_string()))));
+        if self.stale {
+            // The user asked for something else in the meantime: go there instead.
+            self.stale = false;
+            if let Some(Ok(session)) = outcome {
+                self.session = Some(session);
+            }
+            self.begin_change();
+            return;
+        }
+        match outcome {
+            Some(Ok(session)) => self.session = Some(session),
+            Some(Err(notice)) => {
+                // No network yet or the name does not resolve (the computer just woke up, the
+                // Wi-Fi is still connecting): that passes by itself, so keep trying.
+                let retry = matches!(notice, Notice::ServerNotFound | Notice::NoNetwork);
+                if retry {
+                    self.retry_at = Some(tokio::time::Instant::now() + RETRY_AFTER);
+                } else {
+                    self.wanted = None;
+                }
+                self.shared
+                    .events
+                    .send(Event::Reg(RegState::Failed { notice, retry }));
+            }
+            None => {
+                if std::mem::take(&mut self.announce_offline) {
+                    self.shared.events.send(Event::Reg(RegState::Offline));
+                }
+            }
+        }
+    }
+
+    fn is_current(&self, id: u64) -> bool {
+        self.change.is_none() && self.session.as_ref().is_some_and(|s| s.id == id)
+    }
+
+    fn on_signal(&mut self, signal: SessionSignal) {
+        match signal {
+            // Never under a call: it may well be alive although registration is not.
+            SessionSignal::Rebuild(id) => {
+                if self.is_current(id) && self.wanted.is_some() && !self.shared.slot.is_busy() {
+                    self.begin_change();
+                }
+            }
+            SessionSignal::GaveUp(id) => {
+                if self.is_current(id) {
+                    self.wanted = None;
+                    self.begin_change();
+                }
+            }
+        }
+    }
+}
+
 pub async fn run(mut commands: UnboundedReceiver<Command>, events: Events) {
+    let (signal_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let slot = Arc::new(CallSlot::default());
     let audio = Arc::new(Mutex::new(AudioSettings::default()));
     let calls = Arc::new(Mutex::new(CallSettings::default()));
-    let mut session: Option<Session> = None;
+    let mut core = Core {
+        shared: Shared {
+            events: events.clone(),
+            slot: slot.clone(),
+            audio: audio.clone(),
+            calls: calls.clone(),
+            signals: signal_tx,
+        },
+        session: None,
+        wanted: None,
+        change: None,
+        stale: false,
+        announce_offline: false,
+        retry_at: None,
+        last_id: 0,
+    };
 
-    while let Some(command) = commands.recv().await {
+    loop {
+        let retry_at = core.retry_at;
+        let command = tokio::select! {
+            command = commands.recv() => command,
+            result = async { core.change.as_mut().expect("checked").await }, if core.change.is_some() => {
+                core.change_finished(result);
+                continue;
+            }
+            _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
+                core.retry_at = None;
+                if core.wanted.is_some() {
+                    core.request_change();
+                }
+                continue;
+            }
+            Some(signal) = signals.recv() => {
+                core.on_signal(signal);
+                continue;
+            }
+        };
+        let Some(command) = command else { break };
         match command {
             Command::Register(account) => {
-                if let Some(old) = session.take() {
-                    old.stop().await;
-                }
+                // The session the call runs on is about to go away.
+                slot.send(CallCtl::Hangup);
+                core.wanted = Some(account);
+                core.announce_offline = false;
                 events.send(Event::Reg(RegState::Connecting));
-                match Session::start(
-                    account,
-                    events.clone(),
-                    slot.clone(),
-                    audio.clone(),
-                    calls.clone(),
-                )
-                .await
-                {
-                    Ok(new) => session = Some(new),
-                    Err(notice) => events.send(Event::Reg(RegState::Failed {
-                        notice,
-                        retry: false,
-                    })),
-                }
+                core.request_change();
             }
             Command::Unregister => {
                 slot.send(CallCtl::Hangup);
-                if let Some(old) = session.take() {
-                    old.stop().await;
-                }
-                events.send(Event::Reg(RegState::Offline));
+                core.wanted = None;
+                core.retry_at = None;
+                core.announce_offline = true;
+                core.request_change();
             }
-            Command::Dial(number) => match &session {
+            Command::Dial(number) => match &core.session {
                 Some(session) => {
                     if let Err(message) = call::start_outgoing(session.call_context(), number) {
                         events.send(Event::Toast(message));
@@ -88,18 +255,20 @@ pub async fn run(mut commands: UnboundedReceiver<Command>, events: Events) {
 
     // Shutting down: end the call and unregister so the station does not think we are online.
     slot.send(CallCtl::Hangup);
-    for _ in 0..30 {
-        if !slot.is_busy() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_until_idle(&slot).await;
+    if let Some(change) = core.change.take()
+        && let Ok(Ok(Some(Ok(session)))) =
+            tokio::time::timeout(Duration::from_secs(4), change).await
+    {
+        core.session = Some(session);
     }
-    if let Some(old) = session.take() {
+    if let Some(old) = core.session.take() {
         old.stop().await;
     }
 }
 
 struct Session {
+    id: u64,
     endpoint: Endpoint,
     ctx: CallContext,
     cancel: CancellationToken,
@@ -108,13 +277,14 @@ struct Session {
 }
 
 impl Session {
-    async fn start(
-        account: Account,
-        events: Events,
-        slot: Arc<CallSlot>,
-        audio: Arc<Mutex<AudioSettings>>,
-        calls: Arc<Mutex<CallSettings>>,
-    ) -> Result<Session, Notice> {
+    async fn start(id: u64, account: Account, shared: Shared) -> Result<Session, Notice> {
+        let Shared {
+            events,
+            slot,
+            audio,
+            calls,
+            signals,
+        } = shared;
         let transport = account.connection.transport;
         let (host, port) = account.server_host_port();
         let mut server_ips: Vec<IpAddr> = Vec::new();
@@ -132,12 +302,13 @@ impl Session {
             server_ips.extend(proxy_targets.iter().map(|a| a.ip()));
             first = proxy_targets[0];
         }
+        server_ips.sort();
         server_ips.dedup();
         let local_ip = net::local_ip_towards(first).map_err(|_| Notice::NoNetwork)?;
         let account = Arc::new(account);
 
         let cancel = CancellationToken::new();
-        let endpoint = create_endpoint(local_ip, cancel.clone(), &account).await?;
+        let (endpoint, udp) = create_endpoint(local_ip, cancel.clone(), &account).await?;
         let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
         let link: SharedLink = Arc::new(Mutex::new(None));
         let ctx = CallContext {
@@ -152,27 +323,30 @@ impl Session {
             slot,
         };
 
+        // Nothing below can fail, so no task is left running without a session that owns it.
+        let transactions = endpoint
+            .incoming_transactions()
+            .map_err(|e| Notice::PhoneStartFailed(e.to_string()))?;
         let serve = tokio::spawn({
             let inner = endpoint.inner.clone();
             async move {
                 let _ = inner.serve().await;
             }
         });
-        let incoming = tokio::spawn(incoming_loop(
-            endpoint
-                .incoming_transactions()
-                .map_err(|e| Notice::PhoneStartFailed(e.to_string()))?,
-            ctx.clone(),
-        ));
-        let registration = tokio::spawn(registration_loop(
-            endpoint.inner.clone(),
+        let incoming = tokio::spawn(incoming_loop(transactions, ctx.clone()));
+        let registration = tokio::spawn(registration_loop(Registrar {
+            id,
+            endpoint: endpoint.inner.clone(),
             account,
             events,
-            cancel.clone(),
+            cancel: cancel.clone(),
             link,
-        ));
+            signals,
+            keepalive: (transport == TransportKind::Udp).then(|| (udp, SipAddr::from(first))),
+        }));
 
         Ok(Session {
+            id,
             endpoint,
             ctx,
             cancel,
@@ -241,7 +415,7 @@ async fn create_endpoint(
     local_ip: IpAddr,
     cancel: CancellationToken,
     account: &Arc<Account>,
-) -> Result<Endpoint, Notice> {
+) -> Result<(Endpoint, rsipstack::transport::udp::UdpConnection), Notice> {
     let start_failed = |e: rsipstack::Error| Notice::PhoneStartFailed(e.to_string());
     // A UDP socket is always bound: it carries UDP calls and gives every other transport a local
     // address to build requests from. Bind to a specific address so Via/Contact name the
@@ -255,7 +429,7 @@ async fn create_endpoint(
     )
     .await
     .map_err(start_failed)?;
-    transport_layer.add_transport(udp.into());
+    transport_layer.add_transport(udp.clone().into());
     transport_layer.outbound = outbound_addr(account);
 
     match account.connection.transport {
@@ -277,13 +451,15 @@ async fn create_endpoint(
     let mut builder = rsipstack::EndpointBuilder::new();
     builder.with_transport_layer(transport_layer);
     builder.with_cancel_token(cancel);
-    builder.with_user_agent("RustSIPPhone/1.0");
+    builder.with_user_agent(concat!("RustSIPPhone/", env!("CARGO_PKG_VERSION")));
     builder.with_inspector(Box::new(SourceStamp));
-    Ok(builder.build())
+    Ok((builder.build(), udp))
 }
 
 /// Our own address as the station will see it. For a connection-oriented transport this opens
 /// (and keeps) the connection, because only then is its local port known.
+// The error type is the SIP stack's own; its size is not ours to change.
+#[allow(clippy::result_large_err)]
 async fn local_address(
     endpoint: &rsipstack::transaction::endpoint::EndpointInnerRef,
     target: &Uri,
@@ -354,18 +530,106 @@ fn describe_error(error: &rsipstack::Error, transport: TransportKind) -> Notice 
     }
 }
 
-async fn registration_loop(
+/// How often an empty packet is sent to the station between registrations, over UDP. Home
+/// routers forget a UDP "connection" after about 30 seconds of silence, and then an incoming
+/// call cannot reach the phone.
+const KEEPALIVE_EVERY: Duration = Duration::from_secs(20);
+
+/// Everything the registration loop works with.
+struct Registrar {
+    id: u64,
     endpoint: rsipstack::transaction::endpoint::EndpointInnerRef,
     account: Arc<Account>,
     events: Events,
     cancel: CancellationToken,
     link: SharedLink,
-) {
+    signals: UnboundedSender<SessionSignal>,
+    /// Over UDP: the socket and the station's address, for keep-alive packets.
+    keepalive: Option<(rsipstack::transport::udp::UdpConnection, SipAddr)>,
+}
+
+impl Registrar {
+    /// Waits for `delay`; returns `true` if the session was stopped meanwhile. While `online`
+    /// over UDP, keeps the router's mapping open with keep-alive packets.
+    async fn idle(&self, delay: Duration, online: bool) -> bool {
+        let deadline = tokio::time::Instant::now() + delay;
+        let keepalive = self.keepalive.as_ref().filter(|_| online);
+        loop {
+            let next = match keepalive {
+                Some(_) => deadline.min(tokio::time::Instant::now() + KEEPALIVE_EVERY),
+                None => deadline,
+            };
+            tokio::select! {
+                _ = self.cancel.cancelled() => return true,
+                _ = tokio::time::sleep_until(next) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            if let Some((socket, station)) = keepalive {
+                // A double line break: stations ignore it, routers count it as traffic.
+                let _ = socket.send_raw(b"\r\n\r\n", station).await;
+            }
+        }
+    }
+
+    fn failed(&self, notice: Notice, retry: bool) {
+        self.events
+            .send(Event::Reg(RegState::Failed { notice, retry }));
+        if !retry {
+            let _ = self.signals.send(SessionSignal::GaveUp(self.id));
+        }
+    }
+
+    /// Counts a failure that a changed network could explain and asks for a new session when
+    /// there were several in a row.
+    fn network_failure(&self, failures: &mut u32) {
+        *failures += 1;
+        if *failures >= REBUILD_AFTER_FAILURES {
+            let _ = self.signals.send(SessionSignal::Rebuild(self.id));
+        }
+    }
+}
+
+/// How long the station really keeps the registration. It may grant less than was asked for, and
+/// says so in the `expires` of our Contact or in the Expires header; renewing by the requested
+/// time would then leave the phone unregistered in between.
+fn granted_expiry(response: &rsipstack::sip::Response, extension: &str, requested: u32) -> u32 {
+    use rsipstack::sip::Header;
+    use rsipstack::sip::prelude::ToTypedHeader;
+    // Other phones on the same extension are listed too; the shortest time is the safe one.
+    let from_contact = response
+        .headers
+        .iter()
+        .filter_map(|header| match header {
+            Header::Contact(contact) => contact.typed().ok(),
+            _ => None,
+        })
+        .filter(|contact| {
+            contact
+                .uri
+                .auth
+                .as_ref()
+                .is_some_and(|auth| auth.user == extension)
+        })
+        .filter_map(|contact| contact.expires())
+        .filter(|secs| *secs > 0)
+        .min();
+    let from_header = response.headers.iter().find_map(|header| match header {
+        Header::Expires(expires) => expires.value().trim().parse::<u32>().ok(),
+        _ => None,
+    });
+    match from_contact.or(from_header) {
+        Some(granted) if granted > 0 => granted.min(requested),
+        _ => requested,
+    }
+}
+
+async fn registration_loop(registrar: Registrar) {
+    let endpoint = &registrar.endpoint;
+    let account = &registrar.account;
     let Ok(target) = account.register_uri().parse::<Uri>() else {
-        events.send(Event::Reg(RegState::Failed {
-            notice: Notice::ServerAddressInvalid,
-            retry: false,
-        }));
+        registrar.failed(Notice::ServerAddressInvalid, false);
         return;
     };
     let transport = account.connection.transport;
@@ -380,27 +644,28 @@ async fn registration_loop(
     );
 
     let mut ever_online = false;
+    let mut failures = 0u32;
     let mut local: Option<HostWithPort> = None;
     loop {
         // Learn our local address first: the Contact header has to carry it (and, for the
         // connection-oriented transports, the transport), and calls reuse it.
         if local.is_none() {
-            match local_address(&endpoint, &target, transport).await {
+            match local_address(endpoint, &target, transport).await {
                 Ok(address) => {
-                    registration.contact = Some(typed_contact(&account, address.clone()));
+                    registration.contact = Some(typed_contact(account, address.clone()));
                     local = Some(address);
                 }
                 Err(error) => {
                     let notice = describe_error(&error, transport);
                     // A certificate or configuration problem is not cured by waiting.
                     let retry = ever_online || !matches!(notice, Notice::TlsProblem(_));
-                    events.send(Event::Reg(RegState::Failed { notice, retry }));
+                    registrar.failed(notice, retry);
                     if !retry {
                         return;
                     }
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(RETRY_AFTER) => {}
+                    registrar.network_failure(&mut failures);
+                    if registrar.idle(RETRY_AFTER, false).await {
+                        break;
                     }
                     continue;
                 }
@@ -408,12 +673,15 @@ async fn registration_loop(
         }
 
         let result = tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = registrar.cancel.cancelled() => break,
             result = registration.register(target.clone(), Some(expiry)) => result,
         };
+        let mut online = false;
         let delay = match result {
             Ok(response) if response.status_code().code() == 200 => {
                 ever_online = true;
+                online = true;
+                failures = 0;
                 // Remember how the station sees us, for the Contact of calls and for the media
                 // address, then keep using it for the next renewal too.
                 let own = local.clone().expect("set above");
@@ -423,26 +691,23 @@ async fn registration_loop(
                     None
                 };
                 let advertised = public.clone().unwrap_or(own);
-                registration.contact = Some(typed_contact(&account, advertised.clone()));
-                *link.lock().unwrap_or_else(|e| e.into_inner()) = Some(LinkInfo {
-                    contact: contact_uri(&account, advertised),
+                registration.contact = Some(typed_contact(account, advertised.clone()));
+                *registrar.link.lock().unwrap_or_else(|e| e.into_inner()) = Some(LinkInfo {
+                    contact: contact_uri(account, advertised),
                     public_ip: public.and_then(|address| match address.host {
                         Host::IpAddr(ip) => Some(ip),
                         Host::Domain(_) => None,
                     }),
                 });
-                events.send(Event::Reg(RegState::Online));
-                refresh_interval(expiry)
+                registrar.events.send(Event::Reg(RegState::Online));
+                refresh_interval(granted_expiry(&response, &account.extension, expiry))
             }
             Ok(response) => {
                 let code = response.status_code().code();
                 let credentials_rejected = matches!(code, 401 | 403 | 404 | 407);
                 // A wrong password is not fixed by retrying: wait until the user corrects the details.
                 let retry = ever_online || !credentials_rejected;
-                events.send(Event::Reg(RegState::Failed {
-                    notice: Notice::RegistrationRejected(code),
-                    retry,
-                }));
+                registrar.failed(Notice::RegistrationRejected(code), retry);
                 if !retry {
                     return;
                 }
@@ -451,16 +716,13 @@ async fn registration_loop(
             Err(error) => {
                 // The connection may have been lost: learn our address again next time.
                 local = None;
-                events.send(Event::Reg(RegState::Failed {
-                    notice: describe_error(&error, transport),
-                    retry: true,
-                }));
+                registrar.failed(describe_error(&error, transport), true);
+                registrar.network_failure(&mut failures);
                 RETRY_AFTER
             }
         };
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(delay) => {}
+        if registrar.idle(delay, online).await {
+            break;
         }
     }
 
@@ -636,7 +898,7 @@ mod tests {
     #[tokio::test]
     async fn forged_headers_do_not_change_the_verified_source() {
         let cancel = CancellationToken::new();
-        let endpoint = create_endpoint(
+        let (endpoint, _udp) = create_endpoint(
             "127.0.0.1".parse().unwrap(),
             cancel.clone(),
             &Arc::new(Account::default()),
@@ -814,19 +1076,145 @@ mod registration_tests {
         }
     }
 
+    fn shared(events: Events) -> (Shared, UnboundedReceiver<SessionSignal>) {
+        let (signals, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared {
+            events,
+            slot: Arc::new(CallSlot::default()),
+            audio: Arc::new(Mutex::new(AudioSettings::default())),
+            calls: Arc::new(Mutex::new(CallSettings::default())),
+            signals,
+        };
+        (shared, receiver)
+    }
+
+    /// Runs the whole core, as the interface does, and collects what it reports.
+    fn start_core() -> (UnboundedSender<Command>, std::sync::mpsc::Receiver<Event>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(run(command_rx, Events::new(tx, Arc::new(|| {}))));
+        (commands, rx)
+    }
+
+    async fn next_event(
+        events: &std::sync::mpsc::Receiver<Event>,
+        wanted: impl Fn(&Event) -> bool,
+    ) -> Event {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.try_recv() {
+                    Ok(event) if wanted(&event) => return event,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("the event arrives within 10 seconds")
+    }
+
+    /// The computer just woke up and the name does not resolve yet. That is no reason to send
+    /// the user back to the sign-in form: the core keeps trying.
+    #[tokio::test]
+    async fn a_station_that_cannot_be_found_yet_is_retried() {
+        let (commands, events) = start_core();
+        let mut unknown = account(5060, TransportKind::Udp, "");
+        unknown.server = "no-such-host.invalid".into();
+        commands.send(Command::Register(unknown)).unwrap();
+        let event = next_event(&events, |e| {
+            matches!(e, Event::Reg(RegState::Failed { .. }))
+        })
+        .await;
+        assert!(
+            matches!(
+                event,
+                Event::Reg(RegState::Failed {
+                    notice: Notice::ServerNotFound,
+                    retry: true
+                })
+            ),
+            "{event:?}"
+        );
+        commands.send(Command::Shutdown).unwrap();
+    }
+
+    /// Signing out is reported even though stopping the session no longer holds the core up.
+    #[tokio::test]
+    async fn signing_out_reports_offline() {
+        let station = start_station(TransportKind::Udp, None).await;
+        let (commands, events) = start_core();
+        commands
+            .send(Command::Register(account(
+                station.port,
+                TransportKind::Udp,
+                "",
+            )))
+            .unwrap();
+        next_event(&events, |e| matches!(e, Event::Reg(RegState::Online))).await;
+        commands.send(Command::Unregister).unwrap();
+        next_event(&events, |e| matches!(e, Event::Reg(RegState::Offline))).await;
+        commands.send(Command::Shutdown).unwrap();
+    }
+
+    /// A session whose registration keeps failing asks to be built again; one that was refused
+    /// for good says so, and the core lets go of it.
+    #[tokio::test]
+    async fn a_dead_registration_asks_for_a_new_session() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (shared, mut signals) = shared(Events::new(tx, Arc::new(|| {})));
+        let (endpoint, _udp) = create_endpoint(
+            "127.0.0.1".parse().unwrap(),
+            CancellationToken::new(),
+            &Arc::new(Account::default()),
+        )
+        .await
+        .unwrap();
+        let registrar = Registrar {
+            id: 7,
+            endpoint: endpoint.inner.clone(),
+            account: Arc::new(Account::default()),
+            events: shared.events.clone(),
+            cancel: CancellationToken::new(),
+            link: Arc::new(Mutex::new(None)),
+            signals: shared.signals.clone(),
+            keepalive: None,
+        };
+        let mut failures = 0;
+        registrar.network_failure(&mut failures);
+        registrar.network_failure(&mut failures);
+        assert!(signals.try_recv().is_err(), "two failures are not enough");
+        registrar.network_failure(&mut failures);
+        assert!(matches!(signals.try_recv(), Ok(SessionSignal::Rebuild(7))));
+        registrar.failed(Notice::RegistrationRejected(403), false);
+        assert!(matches!(signals.try_recv(), Ok(SessionSignal::GaveUp(7))));
+    }
+
+    #[test]
+    fn the_stations_shorter_expiry_wins() {
+        let ok = |extra: &str| {
+            let raw = format!(
+                "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.0.0.5:5060;branch=z9hG4bK1\r\n\
+                 From: <sip:300@x>;tag=1\r\nTo: <sip:300@x>;tag=2\r\nCall-ID: a\r\n\
+                 CSeq: 2 REGISTER\r\n{extra}Content-Length: 0\r\n\r\n"
+            );
+            rsipstack::sip::Response::try_from(raw.as_str()).expect("valid response")
+        };
+        let ours = "Contact: <sip:300@10.0.0.5:5060>;expires=120\r\n";
+        assert_eq!(granted_expiry(&ok(ours), "300", 3600), 120);
+        assert_eq!(granted_expiry(&ok("Expires: 90\r\n"), "300", 3600), 90);
+        assert_eq!(granted_expiry(&ok(""), "300", 600), 600, "nothing said");
+        // Somebody else's phone does not count, and the station cannot grant more than asked.
+        let other = "Contact: <sip:301@10.0.0.9:5060>;expires=20\r\n";
+        assert_eq!(granted_expiry(&ok(other), "300", 600), 600);
+        assert_eq!(granted_expiry(&ok("Expires: 7200\r\n"), "300", 600), 600);
+    }
+
     /// Starts the phone core with `account` and returns the first verdict on its registration.
     async fn first_registration_state(account: Account) -> RegState {
         let (tx, rx) = std::sync::mpsc::channel();
-        let events = Events::new(tx, Arc::new(|| {}));
-        let session = Session::start(
-            account,
-            events,
-            Arc::new(CallSlot::default()),
-            Arc::new(Mutex::new(AudioSettings::default())),
-            Arc::new(Mutex::new(CallSettings::default())),
-        )
-        .await
-        .expect("the session starts");
+        let (shared, _signals) = shared(Events::new(tx, Arc::new(|| {})));
+        let session = Session::start(1, account, shared)
+            .await
+            .expect("the session starts");
         let state = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match rx.try_recv() {
@@ -958,13 +1346,11 @@ mod registration_tests {
     #[tokio::test]
     async fn a_missing_certificate_file_is_reported_by_path() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let events = Events::new(tx, Arc::new(|| {}));
+        let (shared, _signals) = shared(Events::new(tx, Arc::new(|| {})));
         let result = Session::start(
+            1,
             account(5061, TransportKind::Tls, "/definitely/not/here.pem"),
-            events,
-            Arc::new(CallSlot::default()),
-            Arc::new(Mutex::new(AudioSettings::default())),
-            Arc::new(Mutex::new(CallSettings::default())),
+            shared,
         )
         .await;
         assert!(matches!(

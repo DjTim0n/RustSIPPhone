@@ -4,7 +4,7 @@ use crate::i18n::Lang;
 use crate::model::{Account, HistoryEntry};
 use crate::settings::{AudioSettings, CallSettings, ConnectionSettings};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const KEYCHAIN_SERVICE: &str = "RustSIPPhone";
 const HISTORY_LIMIT: usize = 50;
@@ -40,19 +40,39 @@ fn path() -> Option<PathBuf> {
 }
 
 pub fn load() -> Stored {
-    path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    path().map(|path| load_from(&path)).unwrap_or_default()
+}
+
+fn load_from(path: &Path) -> Stored {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Stored::default();
+    };
+    serde_json::from_str(&text).unwrap_or_else(|_| {
+        // The file is there but cannot be read (damaged, or written by a newer version). The
+        // next save would replace it with defaults, so keep a copy the user can recover from.
+        let _ = std::fs::copy(path, path.with_extension("json.bad"));
+        Stored::default()
+    })
 }
 
 pub fn save(stored: &Stored) {
-    let Some(path) = path() else { return };
+    if let Some(path) = path() {
+        save_to(&path, stored);
+    }
+}
+
+/// Writes the settings next to the real file and then moves them into place, so a crash or a
+/// power cut in the middle leaves the old settings intact instead of half a file.
+fn save_to(path: &Path, stored: &Stored) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(text) = serde_json::to_string_pretty(stored) {
-        let _ = std::fs::write(path, text);
+    let Ok(text) = serde_json::to_string_pretty(stored) else {
+        return;
+    };
+    let draft = path.with_extension("json.tmp");
+    if std::fs::write(&draft, text).is_ok() && std::fs::rename(&draft, path).is_err() {
+        let _ = std::fs::remove_file(&draft);
     }
 }
 
@@ -103,6 +123,40 @@ mod tests {
         let text = serde_json::to_string(&stored).unwrap();
         let back: Stored = serde_json::from_str(&text).unwrap();
         assert_eq!(back.language, Lang::Russian);
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rsp-store-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn saving_replaces_the_file_and_leaves_no_draft_behind() {
+        let dir = scratch_dir("save");
+        let path = dir.join("settings.json");
+        let mut stored = Stored {
+            extension: "300".into(),
+            ..Default::default()
+        };
+        save_to(&path, &stored);
+        stored.extension = "301".into();
+        save_to(&path, &stored);
+        assert_eq!(load_from(&path).extension, "301");
+        assert!(!path.with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_damaged_settings_file_is_kept_aside() {
+        let dir = scratch_dir("bad");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{ \"server\": \"10.0.0.1\", ").unwrap();
+        assert_eq!(load_from(&path).server, "");
+        let kept = std::fs::read_to_string(path.with_extension("json.bad")).unwrap();
+        assert!(kept.contains("10.0.0.1"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

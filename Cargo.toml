@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 rsipstack = { version = "0.6.13"}
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-std", "io-util"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 cpal = "0.18.2"
 eframe = "0.36.2"
@@ -28,6 +28,12 @@ tray-icon = "0.26.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSResponder"] }
 objc2-foundation = "0.2"
+
+# A smaller and somewhat faster release binary, at the price of a longer release build.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [dev-dependencies]
 egui_kittest = { version = "0.36.2", features = ["wgpu", "snapshot"] }

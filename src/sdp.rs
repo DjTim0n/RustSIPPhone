@@ -83,11 +83,12 @@ pub fn build_sdp(sdp: &LocalSdp) -> String {
     if let Some(pt) = dtmf_pt {
         formats.push(pt.to_string());
     }
+    let family = if ip.is_ipv6() { "IP6" } else { "IP4" };
     let mut lines = vec![
         "v=0".to_string(),
-        format!("o=rustphone {session_id} {version} IN IP4 {ip}"),
+        format!("o=rustphone {session_id} {version} IN {family} {ip}"),
         "s=RustSIPPhone".to_string(),
-        format!("c=IN IP4 {ip}"),
+        format!("c=IN {family} {ip}"),
         "t=0 0".to_string(),
         format!("m=audio {rtp_port} RTP/AVP {}", formats.join(" ")),
     ];
@@ -138,6 +139,16 @@ impl Remote {
 
 /// Parses the other side's SDP (both the answer to our offer and its offer on an incoming call).
 pub fn parse_remote(sdp: &str) -> Result<Remote, String> {
+    parse(sdp, None)
+}
+
+/// Like [`parse_remote`], but picks `preferred` if the other side lists it at all. A call in
+/// progress keeps its codec this way when a new description arrives.
+pub fn parse_remote_preferring(sdp: &str, preferred: Codec) -> Result<Remote, String> {
+    parse(sdp, Some(preferred))
+}
+
+fn parse(sdp: &str, preferred: Option<Codec>) -> Result<Remote, String> {
     let mut session_ip: Option<IpAddr> = None;
     let mut media_ip: Option<IpAddr> = None;
     let mut media: Option<(u16, Vec<u8>)> = None;
@@ -180,14 +191,12 @@ pub fn parse_remote(sdp: &str) -> Result<Remote, String> {
             } else if media.is_none() {
                 session_direction = Some(attribute);
             }
-        } else if in_audio {
-            if let Some(rest) = line.strip_prefix("a=rtpmap:") {
-                let mut parts = rest.split_whitespace();
-                let pt = parts.next().and_then(|p| p.parse::<u8>().ok());
-                let name = parts.next().unwrap_or("").to_ascii_lowercase();
-                if name.starts_with("telephone-event/8000") {
-                    dtmf_pt = pt;
-                }
+        } else if in_audio && let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            let mut parts = rest.split_whitespace();
+            let pt = parts.next().and_then(|p| p.parse::<u8>().ok());
+            let name = parts.next().unwrap_or("").to_ascii_lowercase();
+            if name.starts_with("telephone-event/8000") {
+                dtmf_pt = pt;
             }
         }
     }
@@ -199,9 +208,9 @@ pub fn parse_remote(sdp: &str) -> Result<Remote, String> {
     let ip = media_ip
         .or(session_ip)
         .ok_or("the SDP has no address (c=)")?;
-    let codec = formats
-        .iter()
-        .find_map(|&pt| Codec::from_payload_type(pt))
+    let codec = preferred
+        .filter(|codec| formats.contains(&codec.payload_type()))
+        .or_else(|| formats.iter().find_map(|&pt| Codec::from_payload_type(pt)))
         .ok_or("no common codec: only PCMU and PCMA are supported")?;
     Ok(Remote {
         addr: SocketAddr::new(ip, port),
@@ -221,6 +230,27 @@ mod tests {
         assert!(sdp.contains("m=audio 40000 RTP/AVP 0 8 101\r\n"));
         assert!(sdp.contains("c=IN IP4 192.168.1.5\r\n"));
         assert!(sdp.contains("a=rtpmap:101 telephone-event/8000\r\n"));
+    }
+
+    #[test]
+    fn an_ipv6_address_is_announced_as_ipv6() {
+        let sdp = build_offer("2001:db8::5".parse().unwrap(), 40000, 1);
+        assert!(sdp.contains("c=IN IP6 2001:db8::5\r\n"), "{sdp}");
+        assert!(
+            sdp.contains("o=rustphone 1 1 IN IP6 2001:db8::5\r\n"),
+            "{sdp}"
+        );
+    }
+
+    #[test]
+    fn a_call_in_progress_keeps_its_codec_if_it_is_still_offered() {
+        let sdp = "c=IN IP4 1.1.1.1\nm=audio 5000 RTP/AVP 0 8\n";
+        assert_eq!(parse_remote(sdp).unwrap().codec, Codec::Pcmu);
+        let kept = parse_remote_preferring(sdp, Codec::Pcma).unwrap();
+        assert_eq!(kept.codec, Codec::Pcma);
+        let only_pcmu = "c=IN IP4 1.1.1.1\nm=audio 5000 RTP/AVP 0\n";
+        let other = parse_remote_preferring(only_pcmu, Codec::Pcma).unwrap();
+        assert_eq!(other.codec, Codec::Pcmu, "the caller sees it changed");
     }
 
     #[test]

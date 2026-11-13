@@ -5,7 +5,7 @@ use crate::media::{self, MediaControl};
 use crate::model::*;
 use crate::ringtone::{Ringtone, Tone};
 use crate::sdp;
-use crate::settings::{AudioSettings, CallSettings};
+use crate::settings::{AudioSettings, CallSettings, DtmfMode};
 use rsipstack::dialog::authenticate::Credential;
 use rsipstack::dialog::dialog::DialogState;
 use rsipstack::dialog::dialog_layer::DialogLayer;
@@ -193,11 +193,11 @@ async fn outgoing(
     let account = &ctx.account;
 
     // Open the devices before the INVITE: if microphone access is missing, better to learn it right away.
-    let audio = match AudioIo::start(&ctx.audio_settings()) {
+    let audio = match open_audio(ctx).await {
         Ok(audio) => audio,
         Err(err) => return Finished::failed(Notice::AudioUnavailable(err)),
     };
-    let rtp_socket = match UdpSocket::bind("0.0.0.0:0").await {
+    let rtp_socket = match bind_rtp(ctx).await {
         Ok(socket) => Arc::new(socket),
         Err(err) => return Finished::failed(Notice::SoundSetupFailed(err.to_string())),
     };
@@ -297,7 +297,7 @@ async fn outgoing(
                 // It changed its mind about where the audio goes: start over with fresh devices.
                 (Some(stale), _) => {
                     drop(stale);
-                    AudioIo::start(&ctx.audio_settings()).ok().map(|audio| {
+                    open_audio(ctx).await.ok().map(|audio| {
                         start_media(
                             ctx,
                             rtp_socket.clone(),
@@ -344,6 +344,25 @@ async fn outgoing(
     };
     ctx.dialog_layer.remove_dialog(&dialog.id());
     result
+}
+
+/// Opens the microphone and the speaker. That can take a while (and waits for the audio thread),
+/// so it is kept off the async threads.
+async fn open_audio(ctx: &CallContext) -> Result<AudioIo, String> {
+    let settings = ctx.audio_settings();
+    tokio::task::spawn_blocking(move || AudioIo::start(&settings))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The socket the call's audio goes through, of the same address family as the address the
+/// session description will name.
+async fn bind_rtp(ctx: &CallContext) -> std::io::Result<UdpSocket> {
+    let any: IpAddr = match ctx.media_ip() {
+        IpAddr::V4(_) => std::net::Ipv4Addr::UNSPECIFIED.into(),
+        IpAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+    };
+    UdpSocket::bind((any, 0)).await
 }
 
 fn response_body(response: &rsipstack::sip::Response) -> Result<String, String> {
@@ -488,7 +507,7 @@ async fn incoming(
         }
     }
 
-    let audio = match AudioIo::start(&ctx.audio_settings()) {
+    let audio = match open_audio(ctx).await {
         Ok(audio) => audio,
         Err(err) => {
             let _ = dialog.reject(Some(StatusCode::ServerInternalError), None);
@@ -496,7 +515,7 @@ async fn incoming(
             return Finished::failed(Notice::AudioUnavailable(err));
         }
     };
-    let rtp_socket = match UdpSocket::bind("0.0.0.0:0").await {
+    let rtp_socket = match bind_rtp(ctx).await {
         Ok(socket) => Arc::new(socket),
         Err(err) => {
             let _ = dialog.reject(Some(StatusCode::ServerInternalError), None);
@@ -572,10 +591,24 @@ struct RunningMedia {
     /// While true the microphone is replaced by silence.
     muted: Arc<AtomicBool>,
     dtmf: UnboundedSender<char>,
+    /// Whether key presses can travel in the audio stream of this call.
+    tones: bool,
+    /// Tells the media where the other side wants its audio now.
+    retarget: UnboundedSender<std::net::SocketAddr>,
     remote: sdp::Remote,
     /// Our RTP port and the id of the session description we sent, which re-offers must reuse.
     local_port: u16,
     session_id: u64,
+}
+
+impl RunningMedia {
+    /// Sends our audio where the other side's new session description asks for it. An all-zero
+    /// address is the old way of saying "hold" and names no place to send to.
+    fn follow(&self, remote: &sdp::Remote) {
+        if !remote.addr.ip().is_unspecified() {
+            let _ = self.retarget.send(remote.addr);
+        }
+    }
 }
 
 impl Drop for RunningMedia {
@@ -597,14 +630,25 @@ fn start_media(
     let local_port = rtp_socket.local_addr().map(|a| a.port()).unwrap_or(0);
     let muted = Arc::new(AtomicBool::new(muted));
     let (dtmf_tx, dtmf_rx) = unbounded_channel();
+    let (retarget_tx, retarget_rx) = unbounded_channel();
     let stop = CancellationToken::new();
+    // "Always in the audio" means just that: if the other side did not name a payload type for
+    // key presses, the usual one is used.
+    let forced_tones = ctx.calls().dtmf_mode == DtmfMode::Rfc4733;
+    let dtmf_pt = remote
+        .dtmf_pt
+        .or(forced_tones.then_some(sdp::DEFAULT_DTMF_PT));
     let task = tokio::spawn(media::run(
         rtp_socket,
-        remote.clone(),
+        sdp::Remote {
+            dtmf_pt,
+            ..remote.clone()
+        },
         audio,
         MediaControl {
             muted: muted.clone(),
             dtmf: dtmf_rx,
+            retarget: retarget_rx,
         },
         ctx.server_ips.to_vec(),
         stop.clone(),
@@ -614,6 +658,8 @@ fn start_media(
         task: Some(task),
         muted,
         dtmf: dtmf_tx,
+        tones: dtmf_pt.is_some(),
+        retarget: retarget_tx,
         remote,
         local_port,
         session_id,
@@ -641,6 +687,9 @@ async fn start_ringback(ctx: &CallContext) -> Option<Ringtone> {
 }
 
 // ----------------------------------------------------------------- conversation
+
+/// How long the phone waits for the station to acknowledge the end of a call.
+const GOODBYE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long a transfer may stay unconfirmed before the phone stops waiting.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -678,11 +727,11 @@ impl CallFlags {
         ctx.events.send(Event::Call(Some(self.view.clone())));
     }
 
-    /// The microphone is off while muted by the user or while the call is on hold.
+    /// The microphone is off while muted by the user or while the call is on hold, whichever
+    /// side put it there: a caller who was told "please hold" must not be listened to either.
     fn apply_mute(&self, media: &RunningMedia) {
-        media
-            .muted
-            .store(self.user_muted || self.view.local_hold, Ordering::Relaxed);
+        let off = self.user_muted || self.view.local_hold || self.view.remote_hold;
+        media.muted.store(off, Ordering::Relaxed);
     }
 }
 
@@ -702,13 +751,11 @@ async fn talk(
     flags.apply_mute(&media);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
 
-    let message = loop {
+    // How the call ends: whether it is we who say goodbye, and what to tell the user.
+    let (say_bye, message) = loop {
         tokio::select! {
             ctl = ctl_rx.recv() => match ctl {
-                Some(CallCtl::Hangup | CallCtl::Reject) | None => {
-                    let _ = dialog.bye().await;
-                    break None;
-                }
+                Some(CallCtl::Hangup | CallCtl::Reject) | None => break (true, None),
                 Some(CallCtl::Mute(on)) => {
                     flags.user_muted = on;
                     flags.view.muted = on;
@@ -742,17 +789,15 @@ async fn talk(
             },
             state = state_rx.recv() => match state {
                 Some(DialogState::Terminated(..)) | None => {
-                    break Some(Notice::PeerEndedCall);
+                    break (false, Some(Notice::PeerEndedCall));
                 }
                 Some(DialogState::Notify(_, request, handle)) => {
                     let _ = handle.reply(rsipstack::sip::StatusCode::OK).await;
                     if is_refer_notify(&request)
                         && let Some(code) = sipfrag_status(&request)
+                        && let Some(done) = flags.transfer_progress(ctx, code)
                     {
-                        if let Some(done) = flags.transfer_progress(ctx, code) {
-                            let _ = dialog.bye().await;
-                            break Some(done);
-                        }
+                        break (true, Some(done));
                     }
                 }
                 Some(state) => answer_in_dialog(ctx, state, &media, &mut flags).await,
@@ -768,11 +813,23 @@ async fn talk(
         }
     };
 
+    // The microphone goes off at once, whatever happens to the goodbye: when the network is
+    // gone (a common reason to hang up) the station never answers it, and waiting for that with
+    // the audio still running would keep sending the room's sound for half a minute.
     media.stop.cancel();
-    let stats = match media.task.take() {
-        Some(task) => task.await.unwrap_or_default(),
-        None => media::MediaStats::default(),
+    let task = media.task.take();
+    let goodbye = async {
+        if say_bye {
+            let _ = tokio::time::timeout(GOODBYE_TIMEOUT, dialog.bye()).await;
+        }
     };
+    let media_done = async {
+        match task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => media::MediaStats::default(),
+        }
+    };
+    let ((), stats) = tokio::join!(goodbye, media_done);
     // If no audio packet arrived for a noticeable time, the network is most likely blocking it.
     let silent = stats.received == 0 && connected_at.elapsed() > Duration::from_secs(5);
     let notice = match (message, silent) {
@@ -813,7 +870,7 @@ impl CallFlags {
 /// Sends a key to the other side the way the settings and the other side's abilities allow.
 async fn send_dtmf(ctx: &CallContext, dialog: &InviteDialog, media: &RunningMedia, digit: char) {
     let tones_negotiated = media.remote.dtmf_pt.is_some();
-    if ctx.calls().dtmf_mode.use_audio_tones(tones_negotiated) {
+    if media.tones && ctx.calls().dtmf_mode.use_audio_tones(tones_negotiated) {
         let _ = media.dtmf.send(digit);
     } else {
         let headers = vec![rsipstack::sip::Header::ContentType(
@@ -855,7 +912,15 @@ async fn renegotiate(
         .reinvite(Some(headers), Some(offer.into_bytes()))
         .await
     {
-        Ok(Some(response)) if response.status_code.kind() == StatusCodeKind::Successful => Ok(()),
+        Ok(Some(response)) if response.status_code.kind() == StatusCodeKind::Successful => {
+            // The answer may name another address for the audio (hold music lives elsewhere).
+            if let Ok(remote) = response_body(&response)
+                .and_then(|body| sdp::parse_remote_preferring(&body, media.remote.codec))
+            {
+                media.follow(&remote);
+            }
+            Ok(())
+        }
         Ok(Some(response)) => Err(response.status_code.code()),
         Ok(None) | Err(_) => Err(0),
     }
@@ -921,13 +986,17 @@ async fn answer_in_dialog(
                 let _ = handle.reply(StatusCode::OK).await;
                 return;
             }
-            match sdp::parse_remote(body) {
-                Ok(remote) => {
+            // The call goes on with the codec it has. An offer without it is refused, which
+            // leaves the call as it was (changing the codec mid-call is not supported).
+            match sdp::parse_remote_preferring(body, media.remote.codec) {
+                Ok(remote) if remote.codec == media.remote.codec => {
                     let held = remote.on_hold();
                     if flags.view.remote_hold != held {
                         flags.view.remote_hold = held;
+                        flags.apply_mute(media);
                         flags.publish(ctx);
                     }
+                    media.follow(&remote);
                     flags.sdp_version += 1;
                     let answer = sdp::build_sdp(&sdp::LocalSdp {
                         ip: ctx.media_ip(),
@@ -945,7 +1014,7 @@ async fn answer_in_dialog(
                         .respond(StatusCode::OK, Some(headers), Some(answer.into_bytes()))
                         .await;
                 }
-                Err(_) => {
+                _ => {
                     let _ = handle.reply(StatusCode::NotAcceptableHere).await;
                 }
             }
@@ -1055,12 +1124,20 @@ mod tests {
     }
 
     fn media() -> RunningMedia {
+        media_with_moves().0
+    }
+
+    /// A call's media, plus the addresses it is told to send audio to.
+    fn media_with_moves() -> (RunningMedia, UnboundedReceiver<std::net::SocketAddr>) {
         let (dtmf, _rx) = unbounded_channel();
-        RunningMedia {
+        let (retarget, moves) = unbounded_channel();
+        let media = RunningMedia {
             stop: CancellationToken::new(),
             task: None,
             muted: Arc::new(AtomicBool::new(false)),
             dtmf,
+            tones: true,
+            retarget,
             remote: sdp::Remote {
                 addr: "10.0.0.2:20000".parse().unwrap(),
                 codec: crate::g711::Codec::Pcma,
@@ -1069,7 +1146,45 @@ mod tests {
             },
             local_port: 40000,
             session_id: 77,
-        }
+        };
+        (media, moves)
+    }
+
+    #[tokio::test]
+    async fn being_put_on_hold_switches_the_microphone_off_until_resumed() {
+        let (ctx, _events) = context();
+        let (media, mut moves) = media_with_moves();
+        let mut flags = flags();
+        let offer = |direction: &str| {
+            let sdp =
+                format!("v=0\r\nc=IN IP4 10.0.0.9\r\nm=audio 30000 RTP/AVP 8\r\na={direction}\r\n");
+            let (handle, _replies) = TransactionHandle::new();
+            DialogState::Updated(dialog_id(), request("INVITE", &sdp), handle)
+        };
+        answer_in_dialog(&ctx, offer("sendonly"), &media, &mut flags).await;
+        assert!(media.muted.load(Ordering::Relaxed), "held: nothing is sent");
+        // The new description also moved the audio: ours has to follow.
+        assert_eq!(
+            moves.try_recv().ok(),
+            Some("10.0.0.9:30000".parse().unwrap())
+        );
+        answer_in_dialog(&ctx, offer("sendrecv"), &media, &mut flags).await;
+        assert!(!media.muted.load(Ordering::Relaxed), "resumed");
+    }
+
+    #[tokio::test]
+    async fn an_offer_without_the_calls_codec_is_refused() {
+        // The call runs on PCMA; PCMU alone would need a codec change mid-call.
+        let sdp = "v=0\r\nc=IN IP4 10.0.0.2\r\nm=audio 20000 RTP/AVP 0\r\n";
+        let (reply, _flags, _events) =
+            answer(|h| DialogState::Updated(dialog_id(), request("INVITE", sdp), h)).await;
+        assert_eq!(reply.map(|r| r.0), Some(StatusCode::NotAcceptableHere));
+        // Listed second, it is still the one the call keeps.
+        let sdp = "v=0\r\nc=IN IP4 10.0.0.2\r\nm=audio 20000 RTP/AVP 0 8\r\n";
+        let (reply, _flags, _events) =
+            answer(|h| DialogState::Updated(dialog_id(), request("INVITE", sdp), h)).await;
+        let body = String::from_utf8(reply.unwrap().1.unwrap()).unwrap();
+        assert!(body.contains("RTP/AVP 8 101"), "{body}");
     }
 
     fn flags() -> CallFlags {
