@@ -27,7 +27,7 @@ jobs:
       matrix:
         include:
           - name: macOS
-            os: macos-14
+            os: macos-15
             artifact: RustSIPPhone-macos
           - name: Windows
             os: windows-latest
